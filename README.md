@@ -76,10 +76,6 @@ Open REPL and run:
 import main
 
 
-To soft-reboot while debugging:
-
-Ctrl+D
-
 📡 Output
 
 Decoded radiosonde data may include:
@@ -105,14 +101,4 @@ Local dashboard on ESP32-C3
 📍 Status
 
 This project is in active development and intended for hobbyist experimentation with radiosondes.
-Future improvements may include:
 
-Automatic frequency tracking
-
-Improved FSK demodulator
-
-OLED/TFT display output
-
-Logging to SD card
-
-Full SondeHub ingestion support

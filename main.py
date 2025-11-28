@@ -1,172 +1,137 @@
 # main.py
-# ESP32-C3 (Seeed XIAO) + CC1101 + Meteomodem M20
 #
-# Функции:
-#   - подключение к Wi-Fi
-#   - запуск веб-интерфейса
-#   - циклический автопоиск частоты в диапазоне 400–410 МГц
-#   - приём и декодирование кадров M20
-#   - онлайн RSSI для поиска зонда
-#   - возврат к поиску, если зонд пропал или нажата кнопка "Перезапустить поиск"
+# Главный цикл M20 tracker:
+#   - приём на фиксированной частоте (из config.RF_FREQUENCY_HZ, сейчас 405 МГц),
+#   - приём и декодирование M20,
+#   - обновление track_store,
+#   - уход в "потерю" при отсутствии валидных пакетов,
+#   - по запросу Web UI — мягкий "рестарт" приёма (но без сканирования).
 
-import network
 import time
-import _thread
-
-import config
-from cc1101 import CC1101
+from cc1101 import CC1101, CC1101ReceiveError
 from m20_decoder import decode_m20_frame
-from track_store import append_data_point, update_rf_status, consume_restart_flag
-import web_ui
-import afc
+from sonde_data import DATA_POS
+import track_store
+from config import PIN_SCK, PIN_MOSI, PIN_MISO, PIN_CS, PIN_GDO0, RF_FREQUENCY_HZ
 
 
-def connect_wifi():
-    """
-    Подключение к Wi-Fi. Если не удалось за 5 секунд —
-    просто продолжаем без сети (радио и так будет работать).
-    """
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
+def run_tracker():
+    # Инициализация CC1101
+    radio = CC1101(
+        sck=PIN_SCK,
+        mosi=PIN_MOSI,
+        miso=PIN_MISO,
+        cs=PIN_CS,
+        gdo0=PIN_GDO0,
+    )
+    print("CC1101 инициализирован.")
 
-    try:
-        if not wlan.isconnected():
-            print("Подключаюсь к Wi-Fi:", config.WIFI_SSID)
-            wlan.connect(config.WIFI_SSID, config.WIFI_PASS)
-            t0 = time.ticks_ms()
-            # даём до 5 секунд на подключение
-            while (not wlan.isconnected()
-                   and time.ticks_diff(time.ticks_ms(), t0) < 5000):
-                time.sleep_ms(200)
+    # Фиксируем рабочую частоту (сейчас 405 МГц)
+    base_freq = RF_FREQUENCY_HZ
+    print("Устанавливаю фиксированную частоту приёма: %.3f MHz" % (base_freq / 1e6))
+    radio.set_frequency(base_freq)
+    radio.enter_rx()
+    track_store.set_rf_status(base_freq, None)
 
-        if wlan.isconnected():
-            ip, mask, gw, dns = wlan.ifconfig()
-            print("Wi-Fi OK, IP:", ip)
-        else:
-            print("Wi-Fi не подключен (продолжаю без сети)")
+    # TRACKING PARAMS
+    LOST_LIMIT = 40         # сколько циклов без валидного пакета можно терпеть
+    RSSI_LOST_MARGIN = 5    # запас по RSSI относительно порога "нормального" сигнала
+    MIN_SIGNAL_RSSI = -95.0 # dBm: ориентировочный порог "что-то есть"
 
-    except KeyboardInterrupt:
-        print("Прервано подключение к Wi-Fi")
-    except Exception as e:
-        print("Ошибка Wi-Fi:", e)
+    lost_counter = 0
 
-    return wlan
-
-
-def http_thread():
-    """
-    Поток для HTTP-сервера.
-    """
-    web_ui.start_server()
-
-
-def main():
-    # 1. Подключаем Wi-Fi (если получится)
-    connect_wifi()
-
-    # 2. Стартуем HTTP-сервер в отдельном потоке
-    try:
-        _thread.start_new_thread(http_thread, ())
-        print("HTTP сервер запущен на порту", config.HTTP_PORT)
-    except Exception as e:
-        print("Не удалось стартовать HTTP-сервер:", e)
-
-    # 3. Инициализируем радио
-    radio = CC1101()
-    print("CC1101 инициализирован, стартовая частота:",
-          config.RF_FREQUENCY_HZ, "Гц")
-
-    # Порог потери зонда:
-    RSSI_LOST_MARGIN = 3.0   # дБ запас относительно порога обнаружения
-    LOST_LIMIT = 40          # сколько циклов подряд считать "нет пакетов", чтобы признать зонд потерянным
-
-    try:
-        # -------- Главный вечный цикл: поиск зонда -> трекинг -> снова поиск --------
-        while True:
-            print("\n=== Режим поиска зондов ===")
-            update_rf_status(None, None)
-
-            # 4. Автопоиск частоты в диапазоне 400–410 МГц
-            best_freq, best_rssi = afc.scan_band(radio)
-
-            if best_freq is None:
-                # зондов нет — подождём и попробуем ещё раз
-                print("Зондов не найдено. Повторю поиск через 10 секунд.\n")
-                update_rf_status(None, None)
-                # небольшая задержка, чтобы не молотить диапазон постоянно
-                time.sleep(10)
-                continue
-
-            # 5. Нашли сигнал выше порога — считаем, что это зонд
-            print("Обнаружен возможный зонд, фиксируюсь на частоте: %.3f MHz"
-                  % (best_freq / 1e6))
-            radio.set_frequency(best_freq)
-            update_rf_status(best_freq, best_rssi)
-
-            print("Перехожу в режим трекинга. Ожидаю кадры длиной",
-                  config.M20_FRAME_LEN, "байт")
-
-            # -------- Режим трекинга --------
+    while True:
+        # -------------------------------
+        # Обработка запроса "рестарт"
+        # -------------------------------
+        if track_store.need_restart:
+            print("Запрос перезапуска от Web UI: сбрасываю состояние приёма.")
+            track_store.clear_restart()
             lost_counter = 0
+            # Перезапускаем приём на той же частоте
+            try:
+                radio.flush_rx()
+            except Exception:
+                pass
+            radio.set_frequency(base_freq)
+            radio.enter_rx()
+            track_store.set_rf_status(base_freq, None)
+            time.sleep_ms(200)
 
-            while True:
-                # Проверяем, не попросил ли веб-интерфейс перезапуск поиска
-                if consume_restart_flag():
-                    print("\nПолучен запрос на перезапуск поиска из веб-интерфейса.")
-                    print("Выход из трекинга и возврат в режим сканирования...\n")
-                    update_rf_status(None, None)
-                    break
+        # -------------------------------
+        # Текущий RSSI
+        # -------------------------------
+        try:
+            cur_rssi = radio.read_rssi_dbm()
+        except Exception:
+            cur_rssi = None
 
-                # Текущий RSSI — для веб-интерфейса и "пеленгации"
-                rssi_now = radio.read_rssi_dbm()
-                update_rf_status(best_freq, rssi_now)
+        track_store.set_rf_status(base_freq, cur_rssi)
 
-                # Принимаем один кадр M20
-                frame = radio.receive_frame(config.M20_FRAME_LEN, timeout_ms=500)
+        # Логика "сигнал потерян / слабый"
+        if cur_rssi is None:
+            lost_counter += 1
+            print("RSSI: None, lost_counter=%d" % lost_counter)
+        elif cur_rssi < MIN_SIGNAL_RSSI - RSSI_LOST_MARGIN:
+            lost_counter += 1
+            print("Слабый RSSI (%.1f dBm), lost_counter=%d" %
+                  (cur_rssi, lost_counter))
+        else:
+            # сигнал вроде живой — потихоньку уменьшаем счётчик потерь
+            lost_counter = max(0, lost_counter - 1)
 
-                if frame is not None:
-                    data = decode_m20_frame(frame)
+        if lost_counter > LOST_LIMIT:
+            # Здесь мы не "пересканируем", а просто констатируем, что зонд потерян.
+            print("Зонд потерян по RSSI на частоте %.3f MHz." % (base_freq / 1e6))
+            # Можно сделать небольшую паузу и продолжать слушать — вдруг появится новый зонд.
+            time.sleep(1)
+            continue
 
-                    if data.fields & 0x04:  # DATA_POS
-                        # получили валидную позицию — сбрасываем счётчик потерь
-                        lost_counter = 0
-                        append_data_point(data)
+        # -------------------------------
+        # Попытка приёма одного кадра
+        # -------------------------------
+        try:
+            frame = radio.receive_frame()
+            # Если дошли до сюда, что-то прочитали — обновим RSSI "по факту кадра"
+            try:
+                latest_rssi = radio.read_rssi_dbm()
+            except Exception:
+                latest_rssi = cur_rssi
+            track_store.set_rf_status(base_freq, latest_rssi)
 
-                        lat_str = "lat=%.6f" % data.lat if data.lat is not None else "lat=None"
-                        lon_str = "lon=%.6f" % data.lon if data.lon is not None else "lon=None"
-                        alt_str = "alt=%.1f m" % data.alt if data.alt is not None else "alt=None"
-                        print(
-                            "M20:",
-                            lat_str,
-                            lon_str,
-                            alt_str,
-                            "RSSI=%.1f dBm" % rssi_now,
-                        )
-                    else:
-                        # кадр пришёл, но позиция не декодировалась
-                        lost_counter += 1
-                else:
-                    # вовсе нет кадра
-                    lost_counter += 1
+        except CC1101ReceiveError:
+            # Таймаут / мусор — считаем "ещё один промах"
+            lost_counter += 1
+            continue
+        except Exception as e:
+            print("Ошибка приёма:", e)
+            lost_counter += 1
+            continue
 
-                # Условия потери зонда:
-                #   1) долго нет валидных пакетов
-                #   2) RSSI опустился ниже порога обнаружения - margin
-                if lost_counter > LOST_LIMIT or \
-                   (rssi_now < (afc.MIN_DETECT_RSSI - RSSI_LOST_MARGIN)):
-                    print("\nПохоже, зонд потерян (нет пакетов / низкий RSSI).")
-                    print("Возвращаюсь в режим поиска...\n")
-                    update_rf_status(None, None)
-                    break
+        # -------------------------------
+        # ДЕКОДИРОВАНИЕ M20
+        # -------------------------------
+        data = decode_m20_frame(frame)
 
-                # Небольшая пауза, чтобы не забивать UART и дать системе подышать
-                time.sleep_ms(50)
+        # Если декодер вернул пустую структуру или без координат — игнорируем
+        if (data is None) or not (data.fields & DATA_POS):
+            lost_counter += 1
+            continue
 
-    except KeyboardInterrupt:
-        print("Остановка main() по KeyboardInterrupt")
-    except Exception as e:
-        print("Фатальная ошибка в main():", e)
+        # Валидный пакет с координатами → сбрасываем счётчик потерь
+        lost_counter = 0
+
+        print("Получена точка: lat=%.5f lon=%.5f alt=%.1f" %
+              (data.lat, data.lon, data.alt))
+
+        track_store.update_latest(data)
+        track_store.append_track(data)
+
+        # Небольшая пауза, чтобы не грузить CPU
+        time.sleep_ms(30)
 
 
 if __name__ == "__main__":
-    main()
+    # Если запускать main.py напрямую (без boot.py),
+    # трекер всё равно стартанёт.
+    run_tracker()

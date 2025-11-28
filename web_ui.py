@@ -12,13 +12,15 @@ import socket
 import time
 import json
 import config
-from track_store import latest, rf_freq_hz, rf_rssi_dbm, request_restart
+import track_store  # вместо from track_store import ...
 
 
 def _build_status_dict():
     """
     Готовим словарь со статусом для JSON API.
     """
+    latest = track_store.latest
+
     if latest.time:
         t = time.localtime(latest.time)
         ts = "%04d-%02d-%02d %02d:%02d:%02d" % (
@@ -27,7 +29,8 @@ def _build_status_dict():
     else:
         ts = None
 
-    has_pos = bool(latest.fields & 0x04)  # DATA_POS
+    # DATA_POS = 0x04
+    has_pos = bool(latest.fields & 0x04)
 
     return {
         "timestamp": ts,
@@ -35,8 +38,8 @@ def _build_status_dict():
         "lat": latest.lat,
         "lon": latest.lon,
         "alt": latest.alt,
-        "rf_freq_hz": rf_freq_hz,
-        "rf_rssi_dbm": rf_rssi_dbm,
+        "rf_freq_hz": track_store.rf_freq_hz,
+        "rf_rssi_dbm": track_store.rf_rssi_dbm,
     }
 
 
@@ -322,7 +325,7 @@ def _handle_api_restart(cl):
     """
     Обработчик /api/restart: ставим флаг перезапуска поиска.
     """
-    request_restart()
+    track_store.request_restart()
     body = json.dumps({"ok": True})
     header = (
         "HTTP/1.1 200 OK\r\n"
@@ -381,3 +384,11 @@ def start_server():
             print("HTTP error:", e)
         finally:
             cl.close()
+
+
+def run_server(host="0.0.0.0", port=config.HTTP_PORT):
+    """
+    Обёртка для совместимости с boot.py.
+    host/port сейчас игнорируем, но при желании можно прокинуть их в start_server().
+    """
+    start_server()

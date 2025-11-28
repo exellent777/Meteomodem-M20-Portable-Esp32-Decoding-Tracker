@@ -39,11 +39,17 @@ def scan_band(radio):
     print("Начинаю сканирование диапазона %d–%d Гц, шаг %d Гц" %
           (SCAN_START_HZ, SCAN_END_HZ, SCAN_STEP_HZ))
 
+    # Включаем приём, чтобы RSSI был валидным на всех частотах
+    try:
+        radio.enter_rx()
+    except Exception as e:
+        print("Не удалось перейти в RX перед сканированием:", e)
+
     while f <= SCAN_END_HZ:
         try:
             # Устанавливаем частоту
             radio.set_frequency(f)
-            # даём PLL устаканиться
+            # даём PLL и AGC устаканиться
             time.sleep_ms(10)
 
             # Собираем несколько измерений RSSI и усредняем

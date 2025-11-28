@@ -1,45 +1,36 @@
 # sonde_data.py
-# Структура данных для хранения информации о метеозонде.
-# Используется декодером, трекером и веб-интерфейсом.
+# Структура данных для метeoзонда M20 (или совместимого формата).
+#
+# Храним:
+#   - type: тип фрейма (0x20 = позиционный)
+#   - fields: битовая маска присутствующих данных
+#   - time: unix timestamp (float)
+#   - lat, lon, alt
+#   - дополнительные служебные поля при необходимости
 
-DATA_NONE   = 0x00
-DATA_PTU    = 0x01
-DATA_TIME   = 0x02
-DATA_POS    = 0x04
-DATA_SPEED  = 0x08
-DATA_SERIAL = 0x10
+# Битовая маска для data.fields
+# DATA_POS  - флаг "в пакете есть координаты"
+# DATA_TIME - флаг "есть метка времени"
+DATA_POS  = 0x04
+DATA_TIME = 0x08
 
 
 class SondeData:
-    def __init__(self):
-        self.fields = DATA_NONE
+    """
+    Простая структура для хранения данных декодированного пакета метеозонда.
+    """
 
-        # Позиция
+    def __init__(self):
+        self.type = None
+        self.fields = 0
+
+        self.time = None   # UTC timestamp
         self.lat = None
         self.lon = None
         self.alt = None
 
-        # Время пакета (или локальное время)
-        self.time = None
-
-        # Скорость/курс/вертикальная скорость — используем, если добавим позже
-        self.speed = None
-        self.heading = None
-        self.climb = None
-
-        # Серийный номер (если нужен)
-        self.serial = None
-
-    def as_dict(self):
-        """Удобный вывод для JSON, отладки и веб-интерфейса."""
-        return {
-            "fields": self.fields,
-            "lat": self.lat,
-            "lon": self.lon,
-            "alt": self.alt,
-            "time": self.time,
-            "speed": self.speed,
-            "heading": self.heading,
-            "climb": self.climb,
-            "serial": self.serial,
-        }
+    def __repr__(self):
+        return (
+            f"SondeData(type={self.type}, fields=0x{self.fields:02X}, "
+            f"time={self.time}, lat={self.lat}, lon={self.lon}, alt={self.alt})"
+        )

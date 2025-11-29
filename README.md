@@ -1,104 +1,115 @@
-M20 Radiosonde Receiver on ESP32-C3 (MicroPython + CC1101)
+ESP32-C3 Meteomodem M20 Radiosonde Tracker (MicroPython)
 
-This project implements a lightweight M20 radiosonde receiver using an ESP32-C3, a CC1101 transceiver module, and MicroPython.
-The goal is to build a compact, low-power, fully standalone device capable of receiving, demodulating, decoding, and forwarding data from M20 weather balloons.
+This project turns an ESP32-C3 board plus a CC1101 RF module into a standalone Meteomodem M20 radiosonde tracker with Wi-Fi web UI, automatic band scan, and basic flight track logging.
 
-✨ Features
+The firmware is written in MicroPython and is designed to sit in a box on the roof: once powered, it connects to Wi-Fi, starts an HTTP server with a simple dashboard, and continuously searches for M20 sondes around 405 MHz.
 
-Uses CC1101 as the RF front-end (433 MHz band)
+Features
 
-Works on MicroPython – no need for Arduino or full SDR
+ESP32-C3 + CC1101 based receiver
 
-Reads demodulated M20 frames from a custom decoder
+Custom MicroPython CC1101 driver:
 
-Parses frame length defined by M20_FRAME_LEN
+2-FSK, ~9.6 kbit/s, ≈100 kHz RX bandwidth
 
-Connects to Wi-Fi and pushes data to external services (SondeHub, custom API, or local dashboard)
+Infinite packet length (raw byte stream, no CC1101 packet engine)
 
-Performs soft-restarts safely (useful when Wi-Fi or decoder blocks execution)
+On-chip RSSI in dBm for signal strength / noise estimation
 
-Designed for ESP32-C3 but can run on any MicroPython board
+Automatic boot and Wi-Fi
 
-📡 Architecture Overview
+On power-up the board:
 
-CC1101 captures raw FSK bursts from an M20 radiosonde.
+Connects to Wi-Fi using credentials from config.py
 
-A simple demodulator outputs binary symbols to MicroPython (UART/SPI/GPIO).
+Starts the web UI in a separate thread
 
-ESP32-C3 receives and validates frames based on expected length (M20_FRAME_LEN).
+Enters the main tracking loop
 
-Decoded telemetry (GPS, temperature, pressure, ascent rate) can be printed or sent via Wi-Fi.
+Local Web UI dashboard
 
-A watchdog/soft-reset mechanism (machine.soft_reset()) helps recover from deadlocks during Wi-Fi connect attempts.
+Built-in HTTP server on port 80
 
-🛠 Requirements
+Single-page dashboard showing:
 
-ESP32-C3 module
+Last valid frame time, age, status, and track length
 
-CC1101 433 MHz transceiver
+Latest position (lat/lon/alt) if available
 
-MicroPython v1.20+
+Current RF frequency, RSSI with a signal bar, noise level estimate, signal threshold, lost-cycles counter, and state machine mode
 
-Thonny or any MicroPython-compatible IDE
+Control buttons:
 
-Correct wiring for CC1101 (SCK, MOSI, MISO, CS, GDO0/GDO2)
+Switch between scan mode and fixed-frequency mode
 
-📁 Code Structure
+Request “restart search” from the main loop
 
-main.py – program entry point, Wi-Fi connection, event loop
+JSON API endpoints:
 
-cc1101.py – driver for the transceiver (if used externally)
+GET /api/status — current tracking and RF status
 
-m20_decode.py – frame parser and validation
+POST /api/restart — ask the tracker to re-enter scan
 
-config.py – Wi-Fi settings and constants
+POST /api/mode/{scan|fixed} — change search mode
 
-🔧 Configuration
+AFC / band scan for M20 signals
 
-Set the frame length in your decoder according to the real M20 output:
+Scans 405.0–406.0 MHz with a coarse step (50 kHz), measuring averaged RSSI
 
-M20_FRAME_LEN = 105
+Picks the best candidate frequency and runs a refined scan around the peak with 5 kHz steps
 
+Applies an RSSI threshold (MIN_DETECT_RSSI) to distinguish sondes from pure noise
 
-Then update Wi-Fi settings in config.py:
+In fixed mode, it just sits on a single frequency and decides whether a real signal is present based on averaged RSSI
 
-WIFI_SSID = "your_wifi"
-WIFI_PASS = "your_pass"
+Robust M20 detection logic
 
-🚀 Running
+Main state machine:
 
-Flash MicroPython to ESP32-C3
+SCAN — sweep the band until a candidate frequency with strong RSSI is found (via AFC)
 
-Upload project files
+VALIDATE — lock to that frequency and require several consecutive valid M20 frames with CRC OK before accepting it as a real M20
 
-Open REPL and run:
+TRACK — continuously decode frames and build a flight track
 
-import main
+Automatic fallback:
 
+If RSSI collapses or no valid frames for too long, the tracker marks the sonde as lost and returns to SCAN
 
-📡 Output
+M20 frame decoder (ported from m20mod)
 
-Decoded radiosonde data may include:
+Decodes M20 type-0x20 frames:
 
-GPS latitude/longitude
+Altitude (3-byte unsigned, centimetres → meters)
 
-Altitude
+Latitude/longitude (signed 32-bit, 1e-6 degrees)
 
-Vertical velocity
+Implements original M10/M20 frame checksum (checkM10) logic
 
-Temperature & humidity
+Valid frames set flags for DATA_POS and DATA_TIME and are wrapped in a simple SondeData container
 
-Battery voltage
+Track storage and status sharing
 
-You can forward it to:
+track_store.py keeps:
 
-SondeHub APRS
+Last decoded sonde data
 
-Your own MQTT/HTTP endpoint
+Limited-length flight track (timestamp, lat, lon, alt)
 
-Local dashboard on ESP32-C3
+Current RF frequency, RSSI, noise estimate, signal threshold, lost counter, and “had signal” flag
 
-📍 Status
+Control flags for SCAN vs FIXED mode and a need_restart flag set by the web UI and consumed by the main loop
 
-This project is in active development and intended for hobbyist experimentation with radiosondes.
+All Web UI data is read from this shared store, so you can observe the whole RF & tracking state live.
 
+Hardware
+
+ESP32-C3 board supported by MicroPython
+
+CC1101 400–433 MHz module wired to the SPI pins configured in config.py
+
+Simple 400 MHz antenna (¼-wave, GP, etc.) tuned for around 405 MHz
+
+Wi-Fi network for the web interface
+
+The idea is to have a small, always-on local M20 receiver that you can open in a browser, watch RSSI and status in real time, and use as a field tracker when driving to recover weather balloons.

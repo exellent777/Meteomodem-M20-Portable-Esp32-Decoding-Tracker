@@ -1,4 +1,3 @@
-# cc1101.py
 # Простейший драйвер CC1101 для MicroPython (ESP32-C3 / ESP32-S3 / XIAO).
 # Работаем по SPI, читаем сырые байты из RX FIFO, умеем мерить RSSI,
 # переключаться в RX и задавать частоту.
@@ -20,8 +19,11 @@ READ_BURST  = 0xC0
 
 # ----- Регистры CC1101 -----
 REG_IOCFG2   = 0x00
+REG_IOCFG1   = 0x01
 REG_IOCFG0   = 0x02
 REG_FIFOTHR  = 0x03
+REG_SYNC1    = 0x04
+REG_SYNC0    = 0x05
 REG_PKTLEN   = 0x06
 REG_PKTCTRL1 = 0x07
 REG_PKTCTRL0 = 0x08
@@ -37,11 +39,17 @@ REG_MDMCFG3  = 0x11
 REG_MDMCFG2  = 0x12
 REG_MDMCFG1  = 0x13
 REG_MDMCFG0  = 0x14
+REG_DEVIATN  = 0x15
+REG_MCSM2    = 0x16
+REG_MCSM1    = 0x17
 REG_MCSM0    = 0x18
 REG_FOCCFG   = 0x19
+REG_BSCFG    = 0x1A
 REG_AGCCTRL2 = 0x1B
 REG_AGCCTRL1 = 0x1C
 REG_AGCCTRL0 = 0x1D
+REG_WOREVT1  = 0x1E
+REG_WOREVT0  = 0x1F
 REG_WORCTRL  = 0x20
 REG_FREND1   = 0x21
 REG_FREND0   = 0x22
@@ -54,11 +62,14 @@ REG_TEST1    = 0x2D
 REG_TEST0    = 0x2E
 
 # Статус-регистры
+REG_PARTNUM  = 0x30
+REG_VERSION  = 0x31
 REG_RSSI     = 0x34    # RSSI
+REG_MARCSTATE= 0x35
 REG_RXBYTES  = 0x3B    # количество байт в RX FIFO (status reg)
 REG_RXFIFO   = 0x3F    # FIFO
 
-# Кварц у CC1101 обычно 26 МГц
+# Кварц у типичных модулей CC1101 — 26 МГц
 XTAL_HZ = 26_000_000
 
 
@@ -86,6 +97,14 @@ class CC1101:
         self.reset()
         self.configure_radio()
 
+        # Для отладки можно выводить part/version
+        try:
+            part = self._read_status(REG_PARTNUM)
+            ver = self._read_status(REG_VERSION)
+            print("CC1101 part=0x%02X ver=0x%02X" % (part, ver))
+        except Exception:
+            pass
+
     # ---------------------- Низкоуровневые операции ----------------------
 
     def _cs_low(self):
@@ -101,7 +120,7 @@ class CC1101:
         self._cs_high()
 
     def write_reg(self, addr, value):
-        """Запись одного регистра."""
+        """Запись одного конфигурационного регистра."""
         self._cs_low()
         self.spi.write(bytearray([addr & 0x3F]))
         self.spi.write(bytearray([value & 0xFF]))
@@ -148,44 +167,70 @@ class CC1101:
 
     def configure_radio(self):
         """
-        Примерная базовая настройка CC1101 в непрерывный приём сырых байтов.
-        Эти значения можно потом тонко подстроить.
+        Базовая настройка CC1101 в непрерывный приём сырых байтов.
+        Модем нацелен на приём Meteomodem M20:
+          - 2-FSK
+          - скорость ~9.6 kbit/s
+          - полоса приёма ~100 kHz (чтобы не бояться сдвига по частоте)
         """
         self.strobe(SIDLE)
         self.flush_rx()
 
-        # Настраиваем выводы GDO
-        # GDO2 / GDO0 — по умолчанию можно оставить как "пакет / sync".
-        self.write_reg(REG_IOCFG2, 0x0D)  # GDO2: serial clock or sync
-        self.write_reg(REG_IOCFG0, 0x0D)  # GDO0: sync / end of packet
+        # Настройка выводов GDO:
+        # GDO2 / GDO0 — "sync / end of packet", нам достаточно GDO0.
+        self.write_reg(REG_IOCFG2, 0x0D)
+        self.write_reg(REG_IOCFG0, 0x0D)
 
         # FIFO пороги
         self.write_reg(REG_FIFOTHR, 0x07)
 
-        # Режим пакетов: сырые байты, без адресации, без CRC
-        self.write_reg(REG_PKTLEN, config.M20_FRAME_LEN & 0xFF)
+        # Пакетный режим:
+        # используем "бесконечный пакет" (infinite length), чтобы CC1101
+        # не резал поток сам. Границу кадра M20 ищем в Python.
+        self.write_reg(REG_PKTLEN, 0xFF)   # при infinite длине не важно
         self.write_reg(REG_PKTCTRL1, 0x00)
-        self.write_reg(REG_PKTCTRL0, 0x00)
+        # PKTCTRL0:
+        #   [1:0] LENGTH_CONFIG = 2 (infinite packet length)
+        #   [2]   CRC_EN = 0 (CRC M20 считаем сами в m20_decoder)
+        self.write_reg(REG_PKTCTRL0, 0x02)
 
         # Частотный синтезатор
         self.write_reg(REG_FSCTRL1, 0x06)
         self.write_reg(REG_FSCTRL0, 0x00)
 
-        # Параметры модема (пример: 4.8 кбит/с, узкая полоса; потом можно уточнить)
-        self.write_reg(REG_MDMCFG4, 0xC7)
+        # Параметры модема под M20:
+        #   - 2-FSK, dev ~47 kHz (дефолт DEVIATN 0x47, если нужен)
+        #   - BW ≈ 101 kHz
+        #   - data rate ≈ 9.6 kbit/s
+        #
+        # MDMCFG4:
+        #   [7:6] CHANBW_E = 3
+        #   [5:4] CHANBW_M = 0 → BW ≈ 101 kHz
+        #   [3:0] DRATE_E  = 8
+        # → 0xC8
+        # MDMCFG3:
+        #   DRATE_M = 131 (0x83) → R ≈ 9.6 kbit/s
+        self.write_reg(REG_MDMCFG4, 0xC8)
         self.write_reg(REG_MDMCFG3, 0x83)
+
+        # Остальные MDMCFG берём типовые
+        # 2-FSK, манчестер-откл, preamble/sync по умолчанию
         self.write_reg(REG_MDMCFG2, 0x13)
         self.write_reg(REG_MDMCFG1, 0x22)
         self.write_reg(REG_MDMCFG0, 0xF8)
 
-        # Автоматические режимы, частотная коррекция, AGC и т.д.
+        # Девиация по умолчанию (можно тюнить позже)
+        # self.write_reg(REG_DEVIATN, 0x47)  # оставим заводское значение
+
+        # Автоматические режимы, частотная/битовая синхронизация, AGC
         self.write_reg(REG_MCSM0, 0x18)
         self.write_reg(REG_FOCCFG, 0x16)
+        self.write_reg(REG_BSCFG,  0x6C)
         self.write_reg(REG_AGCCTRL2, 0x43)
         self.write_reg(REG_AGCCTRL1, 0x40)
         self.write_reg(REG_AGCCTRL0, 0x91)
 
-        # Калибровка, тестовые регистры — типичные рекомендуемые значения
+        # Калибровка и выходной тракт — рекомендованные значения из даташита
         self.write_reg(REG_FREND1, 0x56)
         self.write_reg(REG_FREND0, 0x10)
         self.write_reg(REG_FSCAL3, 0xE9)
@@ -208,7 +253,6 @@ class CC1101:
         Формула из даташита:
             FREQ = int(freq_hz * 2^16 / f_xtal)
         """
-        # Защита от None
         if not freq_hz:
             return
 
@@ -233,7 +277,7 @@ class CC1101:
         Формула из даташита:
             rssi_dec = RSSI_REG (signed, 2's complement)
             RSSI_dBm = rssi_dec / 2 - RSSI_OFFSET
-        Для 433 МГц типичный RSSI_OFFSET ≈ 74.
+        Для 400–433 МГц типичный RSSI_OFFSET ≈ 74.
         """
         rssi_reg = self._read_status(REG_RSSI)
         if rssi_reg >= 128:
@@ -247,9 +291,10 @@ class CC1101:
 
     def receive_frame(self, expected_len=None, timeout_ms=500):
         """
-        Ожидание одного кадра фиксированной длины из RX FIFO.
+        Считать кусок байтов из RX FIFO фиксированной длины expected_len.
 
-        expected_len — длина кадра (по умолчанию config.M20_FRAME_LEN).
+        expected_len — сколько байт хотим прочитать из «бесконечного» потока
+                       (по умолчанию config.M20_FRAME_LEN).
         timeout_ms   — таймаут ожидания.
 
         При успехе:
@@ -267,7 +312,7 @@ class CC1101:
         t_start = time.ticks_ms()
 
         while time.ticks_diff(time.ticks_ms(), t_start) < timeout_ms:
-            # Смотрим, сколько байт в RX FIFO
+            # Сколько байт в RX FIFO
             rxbytes = self._read_status(REG_RXBYTES) & 0x7F
             if rxbytes > 0:
                 to_read = min(rxbytes, expected_len - len(buf))
@@ -276,7 +321,7 @@ class CC1101:
                     buf.extend(chunk)
 
                     if len(buf) >= expected_len:
-                        # получили полный кадр
+                        # получили нужный объём данных
                         self.flush_rx()
                         return bytes(buf[:expected_len])
 

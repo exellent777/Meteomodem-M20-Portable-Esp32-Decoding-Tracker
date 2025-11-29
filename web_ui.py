@@ -2,17 +2,17 @@
 # Веб-интерфейс для ESP32-C3 M20 Tracker.
 #
 # Эндпоинты:
-#   GET  /             -> HTML-страница с JS
-#   GET  /api/status   -> JSON со статусом (позиция, частота, RSSI)
-#   POST /api/restart  -> установить флаг "перезапустить поиск" (для main.py)
-#
-# Работает на обычных сокетах MicroPython.
+#   GET  /              -> HTML-страница с JS
+#   GET  /api/status    -> JSON со статусом (позиция, частота, RSSI, диагностика приёмника)
+#   POST /api/restart   -> установить флаг "перезапустить поиск"
+#   POST /api/mode/scan -> включить режим сканирования диапазона
+#   POST /api/mode/fixed-> включить режим фиксированной частоты
 
 import socket
 import time
 import json
 import config
-import track_store  # вместо from track_store import ...
+import track_store
 
 
 def _build_status_dict():
@@ -21,32 +21,71 @@ def _build_status_dict():
     """
     latest = track_store.latest
 
-    if latest.time:
+    # Человекочитаемое время последнего валидного кадра
+    if getattr(latest, "time", None):
         t = time.localtime(latest.time)
         ts = "%04d-%02d-%02d %02d:%02d:%02d" % (
             t[0], t[1], t[2], t[3], t[4], t[5]
         )
+        age = max(0, int(time.time() - latest.time))
     else:
         ts = None
+        age = None
 
-    # DATA_POS = 0x04
-    has_pos = bool(latest.fields & 0x04)
+    track_len = len(track_store.track)
+
+    # Защита от отсутствующих атрибутов (если прошивка обновлялась по частям)
+    rf_freq_hz = getattr(track_store, "rf_freq_hz", None)
+    rf_rssi_dbm = getattr(track_store, "rf_rssi_dbm", None)
+    rf_mode = getattr(track_store, "rf_mode", "idle")
+    rf_noise_rssi_dbm = getattr(track_store, "rf_noise_rssi_dbm", None)
+    rf_signal_threshold_dbm = getattr(track_store, "rf_signal_threshold_dbm", None)
+    rf_lost_counter = getattr(track_store, "rf_lost_counter", 0)
+    rf_had_signal = getattr(track_store, "rf_had_signal", False)
+
+    rf_control_mode = getattr(track_store, "rf_control_mode", "scan")
+    rf_fixed_freq_hz = getattr(track_store, "rf_fixed_freq_hz", None)
+
+    need_restart = getattr(track_store, "need_restart", False)
+
+    has_pos = (
+        getattr(latest, "lat", None) is not None
+        and getattr(latest, "lon", None) is not None
+    )
 
     return {
-        "timestamp": ts,
+        "ts": ts,
+        "age_sec": age,
         "has_position": has_pos,
-        "lat": latest.lat,
-        "lon": latest.lon,
-        "alt": latest.alt,
-        "rf_freq_hz": track_store.rf_freq_hz,
-        "rf_rssi_dbm": track_store.rf_rssi_dbm,
+        "lat": getattr(latest, "lat", None),
+        "lon": getattr(latest, "lon", None),
+        "alt": getattr(latest, "alt", None),
+        "track_len": track_len,
+
+        # Радиочасть
+        "rf_freq_hz": rf_freq_hz,
+        "rf_rssi_dbm": rf_rssi_dbm,
+
+        # Управление режимом поиска
+        "rf_control_mode": rf_control_mode,
+        "rf_fixed_freq_hz": rf_fixed_freq_hz,
+
+        # Доп. диагностика радиочасти
+        "rf_mode": rf_mode,
+        "rf_noise_rssi_dbm": rf_noise_rssi_dbm,
+        "rf_signal_threshold_dbm": rf_signal_threshold_dbm,
+        "rf_lost_counter": rf_lost_counter,
+        "rf_had_signal": rf_had_signal,
+
+        # Флаг «запрошен рестарт поиска»
+        "need_restart": need_restart,
     }
 
 
 def _html_page():
     """
     Одностраничный интерфейс: JS опрашивает /api/status и
-    по кнопке шлёт /api/restart.
+    по кнопкам шлёт /api/restart и /api/mode/...
     """
     return """<!DOCTYPE html>
 <html>
@@ -55,208 +94,319 @@ def _html_page():
   <title>M20 Tracker</title>
   <style>
     body {
-      font-family: sans-serif;
-      background: #0e141b;
-      color: #e0e0e0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #020617;
+      color: #e5e7eb;
       margin: 0;
       padding: 0;
     }
     header {
       padding: 12px 16px;
-      background: #151c25;
-      border-bottom: 1px solid #222a35;
+      background: #020617;
+      border-bottom: 1px solid #1f2937;
       display: flex;
-      align-items: center;
       justify-content: space-between;
+      align-items: center;
     }
-    h1 {
-      margin: 0;
-      font-size: 20px;
-      color: #5fd7ff;
+    header .title {
+      font-size: 16px;
+      font-weight: 600;
     }
-    .btn {
-      padding: 6px 10px;
-      font-size: 13px;
-      border-radius: 6px;
-      border: 1px solid #374151;
-      background: #1f2937;
-      color: #e5e7eb;
-      cursor: pointer;
+    header .subtitle {
+      font-size: 11px;
+      color: #9ca3af;
     }
-    .btn:hover {
-      background: #111827;
+    main {
+      padding: 12px 16px 32px 16px;
     }
-    .container {
-      padding: 16px;
+    .cards-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 12px;
     }
     .card {
-      background: #151c25;
-      border: 1px solid #222a35;
-      border-radius: 8px;
-      padding: 12px 16px;
-      margin-bottom: 12px;
+      background: #020617;
+      border-radius: 10px;
+      border: 1px solid #1f2937;
+      padding: 10px 12px;
+      min-width: 220px;
+      flex: 1 1 220px;
+      box-sizing: border-box;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
     }
     .card h2 {
       margin: 0 0 8px 0;
-      font-size: 16px;
-      color: #9ad9ff;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .card .small {
+      font-size: 11px;
+      color: #9ca3af;
+      margin-top: 4px;
     }
     .kv {
       display: flex;
       justify-content: space-between;
-      margin: 4px 0;
-      font-size: 14px;
+      align-items: baseline;
+      margin: 2px 0;
+      font-size: 12px;
     }
-    .kv span.label {
+    .kv .label {
       color: #9ca3af;
+      margin-right: 4px;
     }
-    .kv span.value {
-      font-weight: 500;
+    .kv .value {
+      font-variant-numeric: tabular-nums;
     }
     .status-ok {
-      color: #4ade80;
+      color: #22c55e;
+    }
+    .status-warn {
+      color: #eab308;
     }
     .status-bad {
-      color: #fb7185;
+      color: #f97373;
     }
     .rssi-bar {
-      position: relative;
-      width: 100%;
-      height: 20px;
-      background: #111827;
-      border-radius: 10px;
+      margin-top: 4px;
+      width: 100%%;
+      height: 6px;
+      border-radius: 999px;
+      background: #020617;
+      border: 1px solid #374151;
       overflow: hidden;
-      border: 1px solid #1f2933;
-      margin-top: 6px;
     }
     .rssi-bar-inner {
-      position: absolute;
-      top: 0;
-      left: 0;
-      height: 100%;
-      width: 0%;
-      background: linear-gradient(90deg, #22c55e, #f97316, #ef4444);
+      height: 100%%;
+      width: 0%%;
+      background: linear-gradient(90deg, #22c55e, #eab308, #ef4444);
       transition: width 0.2s ease-out;
     }
     .rssi-label {
-      text-align: right;
-      font-size: 12px;
+      margin-top: 4px;
+      font-size: 11px;
       color: #9ca3af;
-      margin-top: 2px;
     }
-    .small {
+    button {
       font-size: 12px;
-      color: #6b7280;
+      padding: 5px 9px;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      outline: none;
+      background: #2563eb;
+      color: #e5e7eb;
+      margin-right: 4px;
+    }
+    button.secondary {
+      background: #334155;
+    }
+    button:disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+    #info {
+      margin-top: 8px;
+      font-size: 11px;
+      color: #9ca3af;
     }
   </style>
 </head>
 <body>
   <header>
-    <h1>Meteomodem M20 – ESP32-C3 Tracker</h1>
-    <button class="btn" onclick="restartSearch()">Перезапустить поиск</button>
+    <div>
+      <div class="title">M20 Tracker</div>
+      <div class="subtitle">ESP32-C3 + CC1101 · локальный приёмник метеозондов</div>
+    </div>
+    <div class="subtitle">
+      Частота по умолчанию: %.3f MHz
+    </div>
   </header>
-  <div class="container">
-
-    <div class="card">
-      <h2>Состояние зонда</h2>
-      <div class="kv">
-        <span class="label">Последнее обновление</span>
-        <span class="value" id="ts">—</span>
+  <main>
+    <div class="cards-row">
+      <div class="card">
+        <h2>Состояние зонда</h2>
+        <div class="kv">
+          <span class="label">Время последнего кадра</span>
+          <span class="value" id="ts">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">Возраст данных</span>
+          <span class="value" id="age">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">Статус</span>
+          <span class="value" id="status">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">Длина трека</span>
+          <span class="value" id="trackLen">0</span>
+        </div>
+        <div class="small">
+          Здесь видно, поймали ли мы уже хоть один валидный кадр M20.
+        </div>
       </div>
-      <div class="kv">
-        <span class="label">Статус</span>
-        <span class="value" id="status">нет данных</span>
+
+      <div class="card">
+        <h2>Последняя позиция</h2>
+        <div class="kv">
+          <span class="label">Широта</span>
+          <span class="value" id="lat">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">Долгота</span>
+          <span class="value" id="lon">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">Высота</span>
+          <span class="value" id="alt">—</span>
+        </div>
+        <div class="small">
+          Координаты последнего успешно декодированного кадра.
+        </div>
       </div>
     </div>
 
-    <div class="card">
-      <h2>Координаты</h2>
-      <div class="kv">
-        <span class="label">Latitude</span>
-        <span class="value" id="lat">—</span>
+    <div class="cards-row">
+      <div class="card">
+        <h2>Радиоканал</h2>
+        <div class="kv">
+          <span class="label">Текущая частота</span>
+          <span class="value" id="freq">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">RSSI</span>
+          <span class="value" id="rssi">—</span>
+        </div>
+        <div class="rssi-bar">
+          <div class="rssi-bar-inner" id="rssiBar"></div>
+        </div>
+        <div class="rssi-label" id="rssiLabel">уровень сигнала</div>
+        <div class="kv">
+          <span class="label">Режим приёмника</span>
+          <span class="value" id="mode">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">Шум</span>
+          <span class="value" id="noise">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">Порог сигнала</span>
+          <span class="value" id="threshold">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">Слабых циклов подряд</span>
+          <span class="value" id="lost">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">Сигнал когда-либо был</span>
+          <span class="value" id="hadSignal">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">Режим поиска</span>
+          <span class="value" id="controlMode">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">Фикс. частота</span>
+          <span class="value" id="fixedFreq">—</span>
+        </div>
+        <div class="kv">
+          <span class="label">Флаг рестарта</span>
+          <span class="value" id="restartFlag">—</span>
+        </div>
       </div>
-      <div class="kv">
-        <span class="label">Longitude</span>
-        <span class="value" id="lon">—</span>
-      </div>
-      <div class="kv">
-        <span class="label">Altitude</span>
-        <span class="value" id="alt">—</span>
-      </div>
-      <div class="small">Высота в метрах по данным зонда.</div>
-    </div>
 
-    <div class="card">
-      <h2>Радиоканал</h2>
-      <div class="kv">
-        <span class="label">Частота приёма</span>
-        <span class="value" id="freq">—</span>
-      </div>
-      <div class="kv">
-        <span class="label">RSSI</span>
-        <span class="value" id="rssi">—</span>
-      </div>
-      <div class="rssi-bar">
-        <div class="rssi-bar-inner" id="rssiBar"></div>
-      </div>
-      <div class="rssi-label" id="rssiLabel">уровень сигнала</div>
-      <div class="small">
-        Бар показывает относительное качество сигнала:
-        от шумового уровня до сильного зонда.
+      <div class="card">
+        <h2>Управление</h2>
+        <div class="kv">
+          <span class="label">Поиск</span>
+          <span class="value">
+            <button id="btnModeScan" class="secondary">Сканирование</button>
+            <button id="btnModeFixed">Фикс %.3f MHz</button>
+          </span>
+        </div>
+        <div class="kv">
+          <span class="label">Перезапуск</span>
+          <span class="value">
+            <button id="btnRestart">Перезапустить поиск</button>
+          </span>
+        </div>
+        <div id="info" class="small">
+          Режим переключается мгновенно, но при смене режима основной
+          цикл заново инициализирует поиск.
+        </div>
       </div>
     </div>
-
-  </div>
+  </main>
 
   <script>
+    function formatLatLon(v) {
+      if (v === null || v === undefined) return "\\u2014";
+      return v.toFixed(5);
+    }
+    function formatAlt(a) {
+      if (a === null || a === undefined) return "\\u2014";
+      return a.toFixed(1) + " м";
+    }
     function formatFreq(hz) {
-      if (hz === null || hz === undefined) return "—";
+      if (hz === null || hz === undefined) return "\\u2014";
       return (hz / 1e6).toFixed(3) + " MHz";
     }
-
-    function formatAlt(alt) {
-      if (alt === null || alt === undefined) return "—";
-      return alt.toFixed(1) + " m";
-    }
-
-    function formatLatLon(x) {
-      if (x === null || x === undefined) return "—";
-      return x.toFixed(6);
-    }
-
-    function mapRssiToPercent(rssi) {
-      // Простейшее отображение:
-      // -110 dBm -> 0%
-      // -90 dBm  -> 50%
-      // -70 dBm  -> 100%
-      if (rssi === null || rssi === undefined) return 0;
-      var min = -110.0;
-      var max = -70.0;
-      var v = (rssi - min) / (max - min);
-      if (v < 0) v = 0;
-      if (v > 1) v = 1;
-      return Math.round(v * 100);
+    function formatDbm(v) {
+      if (v === null || v === undefined) return "\\u2014";
+      return v.toFixed(1) + " dBm";
     }
 
     function updateUI(data) {
       var tsEl = document.getElementById("ts");
+      var ageEl = document.getElementById("age");
       var statusEl = document.getElementById("status");
+      var trackLenEl = document.getElementById("trackLen");
+
       var latEl = document.getElementById("lat");
       var lonEl = document.getElementById("lon");
       var altEl = document.getElementById("alt");
+
       var freqEl = document.getElementById("freq");
       var rssiEl = document.getElementById("rssi");
       var rssiBar = document.getElementById("rssiBar");
       var rssiLabel = document.getElementById("rssiLabel");
 
-      tsEl.textContent = data.timestamp || "нет данных";
+      var modeEl = document.getElementById("mode");
+      var noiseEl = document.getElementById("noise");
+      var thrEl = document.getElementById("threshold");
+      var lostEl = document.getElementById("lost");
+      var hadSignalEl = document.getElementById("hadSignal");
+      var restartFlagEl = document.getElementById("restartFlag");
 
+      var controlModeEl = document.getElementById("controlMode");
+      var fixedFreqEl = document.getElementById("fixedFreq");
+
+      var btnModeScan = document.getElementById("btnModeScan");
+      var btnModeFixed = document.getElementById("btnModeFixed");
+
+      tsEl.textContent = data.ts || "\\u2014";
+      if (data.age_sec !== null && data.age_sec !== undefined) {
+        ageEl.textContent = data.age_sec + " с";
+      } else {
+        ageEl.textContent = "\\u2014";
+      }
+      trackLenEl.textContent = data.track_len || 0;
+
+      // Статус
       if (data.has_position) {
         statusEl.textContent = "позиция получена";
-        statusEl.className = "value status-ok";
+        statusEl.className = "status-ok";
+      } else if (data.rf_mode === "tracking") {
+        statusEl.textContent = "есть сигнал, ждём позицию";
+        statusEl.className = "status-warn";
+      } else if (data.rf_mode === "lost") {
+        statusEl.textContent = "зонд потерян";
+        statusEl.className = "status-warn";
       } else {
         statusEl.textContent = "зонд не обнаружен";
-        statusEl.className = "value status-bad";
+        statusEl.className = "status-bad";
       }
 
       latEl.textContent = formatLatLon(data.lat);
@@ -264,81 +414,119 @@ def _html_page():
       altEl.textContent = formatAlt(data.alt);
 
       freqEl.textContent = formatFreq(data.rf_freq_hz);
+      rssiEl.textContent = formatDbm(data.rf_rssi_dbm);
 
+      // Простая шкала RSSI: -120 .. 0 dBm -> 0..100%%
       if (data.rf_rssi_dbm === null || data.rf_rssi_dbm === undefined) {
-        rssiEl.textContent = "—";
-        rssiBar.style.width = "0%";
-        rssiLabel.textContent = "уровень сигнала";
+        rssiBar.style.width = "0%%";
+        rssiLabel.textContent = "нет измерения RSSI";
       } else {
-        rssiEl.textContent = data.rf_rssi_dbm.toFixed(1) + " dBm";
-        var p = mapRssiToPercent(data.rf_rssi_dbm);
-        rssiBar.style.width = p + "%";
-        rssiLabel.textContent = "уровень сигнала: " + p + " %";
+        var v = data.rf_rssi_dbm;
+        var pct = (v + 120) / 120;
+        if (pct < 0) pct = 0;
+        if (pct > 1) pct = 1;
+        rssiBar.style.width = (pct * 100).toFixed(0) + "%%";
+        rssiLabel.textContent = "RSSI " + formatDbm(v);
       }
+
+      modeEl.textContent = data.rf_mode || "\\u2014";
+      noiseEl.textContent = formatDbm(data.rf_noise_rssi_dbm);
+      thrEl.textContent = formatDbm(data.rf_signal_threshold_dbm);
+      lostEl.textContent = (data.rf_lost_counter != null) ? data.rf_lost_counter : "\\u2014";
+      hadSignalEl.textContent = data.rf_had_signal ? "да" : "нет";
+
+      restartFlagEl.textContent = data.need_restart ? "да" : "нет";
+
+      // Режим поиска
+      var cm = data.rf_control_mode || "scan";
+      if (cm === "fixed") {
+        controlModeEl.textContent = "фиксированная";
+        if (btnModeFixed) btnModeFixed.disabled = true;
+        if (btnModeScan) btnModeScan.disabled = false;
+      } else {
+        controlModeEl.textContent = "сканирование";
+        if (btnModeScan) btnModeScan.disabled = true;
+        if (btnModeFixed) btnModeFixed.disabled = false;
+      }
+      fixedFreqEl.textContent = formatFreq(data.rf_fixed_freq_hz);
     }
 
     function poll() {
       fetch("/api/status")
         .then(function(resp) { return resp.json(); })
         .then(function(data) { updateUI(data); })
-        .catch(function(err) {
-          console.log("poll error:", err);
-        })
+        .catch(function(err) { console.log("poll error:", err); })
         .finally(function() {
-          setTimeout(poll, 500);
+          setTimeout(poll, 800);
         });
     }
 
-    function restartSearch() {
-      fetch("/api/restart", {
-        method: "POST"
-      }).catch(function(err) {
-        console.log("restart error:", err);
-      });
+    function setupControls() {
+      var infoEl = document.getElementById("info");
+      var btnRestart = document.getElementById("btnRestart");
+      var btnModeScan = document.getElementById("btnModeScan");
+      var btnModeFixed = document.getElementById("btnModeFixed");
+
+      if (btnRestart) {
+        btnRestart.addEventListener("click", function() {
+          var btn = btnRestart;
+          btn.disabled = true;
+          infoEl.textContent = "Отправляю запрос перезапуска...";
+          fetch("/api/restart", { method: "POST" })
+            .then(function(resp) { return resp.text(); })
+            .then(function(text) {
+              infoEl.textContent = "Перезапуск поиска запросен.";
+            })
+            .catch(function(err) {
+              console.log("restart error:", err);
+              infoEl.textContent = "Ошибка при запросе перезапуска.";
+            })
+            .finally(function() {
+              setTimeout(function() {
+                btn.disabled = false;
+              }, 1500);
+            });
+        });
+      }
+
+      function setMode(mode) {
+        infoEl.textContent = "Переключаю режим на " + mode + "...";
+        fetch("/api/mode/" + mode, { method: "POST" })
+          .then(function(resp) { return resp.text(); })
+          .then(function(text) {
+            infoEl.textContent = "Режим " + mode + " установлен.";
+          })
+          .catch(function(err) {
+            console.log("mode error:", err);
+            infoEl.textContent = "Ошибка при переключении режима.";
+          });
+      }
+
+      if (btnModeScan) {
+        btnModeScan.addEventListener("click", function() {
+          setMode("scan");
+        });
+      }
+      if (btnModeFixed) {
+        btnModeFixed.addEventListener("click", function() {
+          setMode("fixed");
+        });
+      }
     }
 
     window.addEventListener("load", function() {
+      setupControls();
       poll();
     });
   </script>
 </body>
 </html>
-"""
-
-
-def _handle_api_status(cl):
-    """
-    Обработчик /api/status: отдаём JSON.
-    """
-    status = _build_status_dict()
-    body = json.dumps(status)
-    header = (
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: application/json\r\n"
-        "Connection: close\r\n\r\n"
-    )
-    cl.send(header)
-    cl.send(body)
-
-
-def _handle_api_restart(cl):
-    """
-    Обработчик /api/restart: ставим флаг перезапуска поиска.
-    """
-    track_store.request_restart()
-    body = json.dumps({"ok": True})
-    header = (
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: application/json\r\n"
-        "Connection: close\r\n\r\n"
-    )
-    cl.send(header)
-    cl.send(body)
+""" % (config.RF_FREQUENCY_HZ / 1e6, config.RF_FREQUENCY_HZ / 1e6)
 
 
 def _handle_root(cl):
     """
-    Обработчик /: отдаём HTML-интерфейс.
+    Отдаём HTML-страницу.
     """
     body = _html_page()
     header = (
@@ -346,6 +534,85 @@ def _handle_root(cl):
         "Content-Type: text/html; charset=utf-8\r\n"
         "Connection: close\r\n\r\n"
     )
+    cl.send(header)
+    cl.send(body)
+
+
+def _handle_api_status(cl):
+    """
+    Обработчик /api/status — отдаём JSON.
+    """
+    try:
+        status = _build_status_dict()
+        body = json.dumps(status)
+        code = "200 OK"
+    except Exception as e:
+        body = json.dumps({"error": str(e)})
+        code = "500 Internal Server Error"
+
+    header = (
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+    ) % code
+    cl.send(header)
+    cl.send(body)
+
+
+def _handle_api_restart(cl):
+    """
+    Обработчик /api/restart — ставим флаг в track_store.
+    """
+    try:
+        track_store.request_restart()
+        body = "OK"
+        code = "200 OK"
+    except Exception as e:
+        body = "ERROR: %s" % e
+        code = "500 Internal Server Error"
+
+    header = (
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+    ) % code
+    cl.send(header)
+    cl.send(body)
+
+
+def _handle_api_mode(cl, path: str):
+    """
+    Обработчик /api/mode/scan или /api/mode/fixed — переключаем режим поиска.
+    """
+    try:
+        mode = "scan"
+        if path.startswith("/api/mode/"):
+            tail = path[len("/api/mode/"):]
+            if tail.startswith("fixed"):
+                mode = "fixed"
+            elif tail.startswith("scan"):
+                mode = "scan"
+            else:
+                raise ValueError("unknown mode '%s'" % tail)
+        else:
+            # запасной вариант: /api/mode?mode=fixed
+            if "mode=fixed" in path:
+                mode = "fixed"
+            elif "mode=scan" in path:
+                mode = "scan"
+
+        track_store.set_rf_control_mode(mode)
+        body = "OK %s" % mode
+        code = "200 OK"
+    except Exception as e:
+        body = "ERROR: %s" % e
+        code = "500 Internal Server Error"
+
+    header = (
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+    ) % code
     cl.send(header)
     cl.send(body)
 
@@ -366,18 +633,23 @@ def start_server():
                 cl.close()
                 continue
 
+            # Первая строка: "GET /path HTTP/1.1"
             try:
                 line = req.split(b"\r\n", 1)[0]
+                parts = line.split()
+                method = parts[0]
+                path = parts[1].decode()
             except Exception:
-                line = b""
+                method = b"GET"
+                path = "/"
 
-            # Примитивный роутер по первой строке HTTP-запроса
-            if b"GET /api/status" in line:
+            if path.startswith("/api/status"):
                 _handle_api_status(cl)
-            elif b"POST /api/restart" in line:
+            elif path.startswith("/api/restart") and method in (b"POST", b"GET"):
                 _handle_api_restart(cl)
+            elif path.startswith("/api/mode") and method in (b"POST", b"GET"):
+                _handle_api_mode(cl, path)
             else:
-                # Всё остальное считаем запросом на корень
                 _handle_root(cl)
 
         except Exception as e:

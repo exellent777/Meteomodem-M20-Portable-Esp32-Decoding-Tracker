@@ -1,210 +1,297 @@
 # afc.py
-# Сканирование диапазона 404.5–406.5 MHz для поиска максимального сигнала (M20).
+# Примитивный "AFC" / сканер диапазона для M20.
 #
 # Логика:
-#   1) Грубый проход диапазона 404.5–406.5 MHz с шагом 50 kHz, измеряем RSSI.
-#   2) Выбираем частоту с максимальным средним RSSI.
-#   3) Делаем уточняющий скан вокруг найденного пика с мелким шагом (5 kHz)
-#      в окне ±25 kHz и снова выбираем максимум.
-#   4) Если лучший RSSI ниже порога MIN_DETECT_RSSI — считаем, что зондов нет,
-#      возвращаем (None, None).
-#   5) Иначе возвращаем (best_freq_hz, best_rssi_dbm).
+#   - coarse scan: проходим диапазон грубыми шагами, меряем RSSI, ищем максимум;
+#   - считаем шум как медиану/среднее по всем RSSI;
+#   - если максимум выше порога (noise + MARGIN) — делаем refine вокруг него
+#     мелким шагом и возвращаем оптимальную частоту.
 #
-# Весь прогресс сканирования отдаём в track_store, чтобы это было видно в Web UI.
+#   FIXED-режим:
+#   - если rf_control_mode == "fixed_freq", НИЧЕГО не сканируем,
+#     а просто сидим на заданной частоте, меряем RSSI и решаем,
+#     есть ли кандидат (частота возвращается только если RSSI >= порога).
 
 import time
+import config
 import track_store
 
-# Диапазон сканирования: 405.0–406.0 MHz
-SCAN_START_HZ = 405_350_000
-SCAN_END_HZ   = 405_450_000
-SCAN_STEP_HZ  = 50_000     # шаг грубого скана, 50 kHz
+# Диапазон сканирования (Hz)
+SCAN_START_HZ = int(404.500e6)
+SCAN_STOP_HZ  = int(406.500e6)
+SCAN_STEP_HZ  = int(50e3)
 
-DWELL_MS      = 40         # время "посидеть" на частоте перед измерением RSSI
-RSSI_SAMPLES  = 2          # сколько раз мерить RSSI на каждой частоте
+# Минимальное количество точек, которое хотим набрать в coarse scan
+MIN_POINTS = 10
 
-# Уточняющий скан вокруг найденного пика
-REFINE_SPAN_HZ = 25_000    # ±25 kHz вокруг грубого пика
-REFINE_STEP_HZ = 5_000     # мелкий шаг, 5 kHz
+# Порог детекции: best_rssi >= noise + MARGIN
+RSSI_MARGIN_DB = 6.0  # на сколько dB лучший сигнал должен быть выше шума
 
-# Порог "это зонд, а не просто шум".
-# Типичный шум CC1101 ~ -105 .. -110 dBm, дальний зонд может быть в районе -95 .. -85 dBm,
-# а близкий — вообще -60 .. -40 dBm.
-MIN_DETECT_RSSI = -90.0
+# Абсолютный "пол" — если всё ниже этого, то считаем, что вообще пусто
+ABSOLUTE_MIN_DBM = -110.0
+
+# Кол-во измерений RSSI на одной частоте при скане
+RSSI_SAMPLES_PER_FREQ = 3
+
+# Кол-во измерений в FIXED-режиме (усреднение)
+RSSI_SAMPLES_FIXED = 8
 
 
-def _measure_rssi(radio, freq_hz):
+def _measure_rssi_avg(radio, n=RSSI_SAMPLES_PER_FREQ, delay_ms=50):
     """
-    Установить частоту, немного подождать, несколько раз измерить RSSI
-    и вернуть среднее значение.
+    Несколько раз читаем RSSI у радиомодуля и возвращаем среднее.
     """
-    try:
-        radio.set_frequency(freq_hz)
-        radio.enter_rx()
-    except Exception as e:
-        print("Ошибка установки частоты", freq_hz, ":", e)
+    total = 0.0
+    count = 0
+    for _ in range(n):
+        time.sleep_ms(delay_ms)
+        rssi = radio.read_rssi_dbm()
+        total += rssi
+        count += 1
+    if count == 0:
         return None
+    return total / count
 
-    # Даём приёмнику "устаканиться"
-    time.sleep_ms(DWELL_MS)
 
-    acc = 0.0
-    cnt = 0
-
-    for _ in range(RSSI_SAMPLES):
-        try:
-            rssi = radio.read_rssi_dbm()
-            acc += rssi
-            cnt += 1
-            time.sleep_ms(5)
-        except Exception as e:
-            print("Ошибка чтения RSSI:", e)
-
-    if cnt == 0:
+def _median(values):
+    """
+    Простая медиана по списку чисел.
+    """
+    if not values:
         return None
-
-    return acc / cnt
+    vals = sorted(values)
+    n = len(vals)
+    m = n // 2
+    if n % 2 == 1:
+        return vals[m]
+    return 0.5 * (vals[m - 1] + vals[m])
 
 
 def scan_band(radio):
     """
-    Полный проход диапазона 405.0–406.0 MHz + локальное уточнение пика.
-
-    Возвращает:
-        (best_freq_hz, best_rssi_dbm) — если найден сигнал выше MIN_DETECT_RSSI,
-        (None, None) — если в диапазоне ничего разумного не нашли.
+    Основная функция:
+      - если rf_control_mode == "auto_scan":
+            сканируем диапазон и возвращаем (freq_hz, rssi_dbm)
+        или (None, None), если кандидата нет.
+      - если rf_control_mode == "fixed_freq":
+            сидим на одной частоте, меряем RSSI, логируем в track_store
+            и возвращаем (freq_hz, rssi_dbm) только если RSSI >= порога,
+            иначе (None, None).
     """
-    # Проверяем, не включён ли режим FIXED (фиксированная частота).
-    # В этом режиме не сканируем диапазон, а просто сидим на rf_fixed_freq_hz
-    # и решаем, есть ли там достаточно сильный сигнал, чтобы считать это зондом.
-    ctrl_mode = getattr(track_store, "rf_control_mode", "scan")
-    if ctrl_mode == "fixed":
-        fixed_hz = getattr(track_store, "rf_fixed_freq_hz", None)
-        if fixed_hz is None:
-            # запасной вариант, если что-то пошло не так
-            fixed_hz = SCAN_START_HZ
+    # Узнаём режим управления частотой
+    rf_control_mode, fixed_freq_hz = track_store.get_rf_control_mode()
 
-        try:
-            radio.set_frequency(fixed_hz)
-            radio.enter_rx()
-        except Exception as e:
-            print("Ошибка установки частоты в FIXED-режиме:", e)
-            return None, None
+    # ---------------- FIXED-режим ----------------
+    if rf_control_mode == "fixed_freq":
+        # Частота: либо заданная, либо хотя бы SCAN_START_HZ как запасной вариант
+        if fixed_freq_hz is None:
+            freq_hz = SCAN_START_HZ
+        else:
+            freq_hz = int(fixed_freq_hz)
 
-        # Несколько измерений RSSI для усреднения
-        samples = 0
-        acc = 0.0
-        for _ in range(8):
-            try:
-                rssi = radio.read_rssi_dbm()
-                acc += rssi
-                samples += 1
-                # публикуем в Web UI, чтобы было видно уровень на фиксированной частоте
-                track_store.set_rf_status(fixed_hz, rssi)
-                time.sleep_ms(20)
-            except Exception as e:
-                print("Ошибка чтения RSSI в FIXED-режиме:", e)
-                time.sleep_ms(20)
+        # Выставляем частоту, входим в RX
+        radio.set_frequency(freq_hz)
+        radio.enter_rx()
 
-        if samples == 0:
-            return None, None
+        # Меряем RSSI несколько раз, усредняем
+        avg_rssi = _measure_rssi_avg(
+            radio,
+            n=RSSI_SAMPLES_FIXED,
+            delay_ms=30,
+        )
 
-        avg = acc / samples
-        print("FIXED: freq = %.3f MHz, avg RSSI ≈ %.1f dBm" % (fixed_hz / 1e6, avg))
-
-        # Если сигнал слабый — считаем, что зонда нет
-        if avg < MIN_DETECT_RSSI:
-            return None, None
-
-        # Иначе считаем фиксированную частоту кандидатом «зонда»
-        return fixed_hz, avg
-
-    # ----- обычный режим сканирования диапазона -----
-
-    best_freq = None
-    best_rssi = -999.0
-
-    f = SCAN_START_HZ
-    print("Начинаю сканирование диапазона %.3f–%.3f MHz, шаг %.1f kHz" %
-          (SCAN_START_HZ / 1e6, SCAN_END_HZ / 1e6, SCAN_STEP_HZ / 1e3))
-
-    # Грубый проход
-    while f <= SCAN_END_HZ:
-        try:
-            avg_rssi = _measure_rssi(radio, f)
-            if avg_rssi is None:
-                f += SCAN_STEP_HZ
-                continue
-
-            # Обновляем статус для Web UI: сейчас слушаем частоту f
-            track_store.set_rf_status(f, avg_rssi)
+        # Если измерить не получилось — считаем, что кандидата нет
+        if avg_rssi is None:
+            track_store.set_rf_status(freq_hz, None)
             track_store.set_rf_diagnostics(
                 noise_rssi_dbm=None,
                 signal_threshold_dbm=None,
                 lost_counter=0,
-                had_signal=track_store.rf_had_signal,
-                mode="search",
+                had_signal=False,
+                mode="fixed",
             )
+            print("FIXED: freq=%.3f MHz, RSSI: нет данных" % (freq_hz / 1e6))
+            return None, None
 
-            print("[scan] freq = %.3f MHz, RSSI ≈ %.1f dBm" % (f / 1e6, avg_rssi))
+        # Порог: либо noise+margin (который мы здесь не знаем), либо просто "адекватный минимум"
+        # Чтобы не усложнять, используем фиксированный порог, но можно подстроить.
+        MIN_DETECT_RSSI = ABSOLUTE_MIN_DBM + 10.0  # примерно -100 dBm
 
-            if avg_rssi > best_rssi:
-                best_rssi = avg_rssi
-                best_freq = f
+        had_signal = avg_rssi >= MIN_DETECT_RSSI
 
-        except Exception as e:
-            print("Ошибка при сканировании частоты", f, ":", e)
+        # Логируем в track_store для Web UI
+        track_store.set_rf_status(freq_hz, avg_rssi)
+        track_store.set_rf_diagnostics(
+            noise_rssi_dbm=None,
+            signal_threshold_dbm=MIN_DETECT_RSSI,
+            lost_counter=0,
+            had_signal=had_signal,
+            mode="fixed",
+        )
 
-        f += SCAN_STEP_HZ
+        if not had_signal:
+            print(
+                "FIXED: freq=%.3f MHz, avg RSSI=%.1f dBm < threshold (%.1f dBm) -> нет кандидата"
+                % (freq_hz / 1e6, avg_rssi, MIN_DETECT_RSSI)
+            )
+            return None, None
 
-    if best_freq is None:
-        print("Сканирование: ни одной частоты измерить не удалось.")
+        print(
+            "FIXED: freq=%.3f MHz, avg RSSI=%.1f dBm >= threshold (%.1f dBm) -> кандидат"
+            % (freq_hz / 1e6, avg_rssi, MIN_DETECT_RSSI)
+        )
+        return freq_hz, avg_rssi
+
+    # ---------------- AUTO SCAN режим ----------------
+    # Коурс-скан: идём от SCAN_START_HZ до SCAN_STOP_HZ шагом SCAN_STEP_HZ
+    best_freq = None
+    best_rssi = None
+    rssi_values = []
+
+    freq = SCAN_START_HZ
+    print(
+        "Начинаю сканирование диапазона %.3f–%.3f MHz, шаг %.1f kHz"
+        % (SCAN_START_HZ / 1e6, SCAN_STOP_HZ / 1e6, SCAN_STEP_HZ / 1e3)
+    )
+
+    while freq <= SCAN_STOP_HZ:
+        # Выставляем частоту и меряем средний RSSI
+        radio.set_frequency(freq)
+        radio.enter_rx()
+
+        avg_rssi = _measure_rssi_avg(radio, n=RSSI_SAMPLES_PER_FREQ, delay_ms=50)
+        if avg_rssi is None:
+            freq += SCAN_STEP_HZ
+            continue
+
+        print("SCAN: freq = %.3f MHz, RSSI ≈ %.1f dBm" % (freq / 1e6, avg_rssi))
+        rssi_values.append(avg_rssi)
+
+        # Обновляем лучший найденный сигнал
+        if best_rssi is None or avg_rssi > best_rssi:
+            best_rssi = avg_rssi
+            best_freq = freq
+
+        # Обновляем статус для Web UI
+        track_store.set_rf_status(freq, avg_rssi)
+        track_store.set_rf_diagnostics(
+            noise_rssi_dbm=None,
+            signal_threshold_dbm=None,
+            lost_counter=0,
+            had_signal=False,
+            mode="scan",
+        )
+
+        freq += SCAN_STEP_HZ
+
+    # Если вообще ничего не померили — возвращаем None
+    if not rssi_values or best_freq is None:
+        print("SCAN: нет ни одного измерения RSSI, возвращаю (None, None)")
         return None, None
 
-    print("Сканирование (грубое) завершено, max RSSI ≈ %.1f dBm" % best_rssi)
+    # Оценка шума — по медиане
+    noise = _median(rssi_values)
+    if noise is None:
+        noise = ABSOLUTE_MIN_DBM
 
-    # Если максимум и так очень слабый — дальше не уточняем
-    if best_rssi < MIN_DETECT_RSSI:
-        print("Максимум слишком слабый для зонда (%.1f dBm < %.1f dBm)." %
-              (best_rssi, MIN_DETECT_RSSI))
+    threshold = max(noise + RSSI_MARGIN_DB, ABSOLUTE_MIN_DBM)
+    print(
+        "SCAN: шум ≈ %.1f dBm, порог детекции = max(noise + %.1f, %.1f) = %.1f dBm"
+        % (noise, RSSI_MARGIN_DB, ABSOLUTE_MIN_DBM, threshold)
+    )
+    print(
+        "SCAN: лучший найденный сигнал: freq=%.3f MHz, RSSI=%.1f dBm"
+        % (best_freq / 1e6, best_rssi)
+    )
+
+    # Если лучший сигнал ниже порога — кандидата нет
+    if best_rssi < threshold:
+        print(
+            "SCAN: best_rssi=%.1f dBm < threshold=%.1f dBm => кандидата нет, продолжаем сканирование позже"
+            % (best_rssi, threshold)
+        )
+        # Логируем диагностику шума
+        track_store.set_rf_diagnostics(
+            noise_rssi_dbm=noise,
+            signal_threshold_dbm=threshold,
+            lost_counter=0,
+            had_signal=False,
+            mode="scan",
+        )
         return None, None
 
-    # Уточняющий скан вокруг best_freq
-    refine_start = best_freq - REFINE_SPAN_HZ
-    refine_end = best_freq + REFINE_SPAN_HZ
+    # ----- уточняющий проход вокруг лучшей частоты -----
+    fine_step = int(5e3)  # 5 kHz для уточнения
+    span = int(50e3)      # ±50 kHz от best_freq
 
-    refined_freq = best_freq
-    refined_rssi = best_rssi
+    refine_start = max(SCAN_START_HZ, best_freq - span)
+    refine_stop  = min(SCAN_STOP_HZ, best_freq + span)
 
-    print("Уточняющий скан в окне %.3f–%.3f MHz, шаг %.1f kHz" %
-          (refine_start / 1e6, refine_end / 1e6, REFINE_STEP_HZ / 1e3))
+    print(
+        "SCAN refine: уточняем вокруг %.3f MHz в диапазоне %.3f–%.3f MHz шагом %.1f kHz"
+        % (best_freq / 1e6, refine_start / 1e6, refine_stop / 1e6, fine_step / 1e3)
+    )
 
-    f = refine_start
-    while f <= refine_end:
-        try:
-            avg_rssi = _measure_rssi(radio, f)
-            if avg_rssi is None:
-                f += REFINE_STEP_HZ
-                continue
+    refine_best_freq = best_freq
+    refine_best_rssi = best_rssi
 
-            track_store.set_rf_status(f, avg_rssi)
-            print("[refine] freq = %.3f MHz, RSSI ≈ %.1f dBm" % (f / 1e6, avg_rssi))
+    freq = refine_start
+    while freq <= refine_stop:
+        radio.set_frequency(freq)
+        radio.enter_rx()
 
-            if avg_rssi > refined_rssi:
-                refined_rssi = avg_rssi
-                refined_freq = f
-        except Exception as e:
-            print("Ошибка при уточняющем скане на частоте", f, ":", e)
-        f += REFINE_STEP_HZ
+        avg_rssi = _measure_rssi_avg(radio, n=4, delay_ms=40)
+        if avg_rssi is None:
+            freq += fine_step
+            continue
 
-    print("Итог сканирования: freq = %.3f MHz, RSSI ≈ %.1f dBm" %
-          (refined_freq / 1e6, refined_rssi))
+        print("SCAN refine: freq = %.3f MHz, RSSI ≈ %.1f dBm" % (freq / 1e6, avg_rssi))
 
-    if refined_rssi < MIN_DETECT_RSSI:
-        print("Даже после уточнения максимум слишком слабый для зонда.")
+        # Обновляем лучший результат
+        if avg_rssi > refine_best_rssi:
+            refine_best_rssi = avg_rssi
+            refine_best_freq = freq
+
+        # Логируем для Web UI "живой" процесс
+        track_store.set_rf_status(freq, avg_rssi)
+        track_store.set_rf_diagnostics(
+            noise_rssi_dbm=noise,
+            signal_threshold_dbm=threshold,
+            lost_counter=0,
+            had_signal=True,
+            mode="scan-refine",
+        )
+
+        freq += fine_step
+
+    print(
+        "SCAN refine: итоговая частота-кандидат: %.3f MHz, RSSI=%.1f dBm"
+        % (refine_best_freq / 1e6, refine_best_rssi)
+    )
+
+    # Финальная проверка на порог
+    if refine_best_rssi < threshold:
+        print(
+            "SCAN refine: даже уточнённый максимум ниже порога (%.1f < %.1f), кандидата нет"
+            % (refine_best_rssi, threshold)
+        )
+        track_store.set_rf_diagnostics(
+            noise_rssi_dbm=noise,
+            signal_threshold_dbm=threshold,
+            lost_counter=0,
+            had_signal=False,
+            mode="scan",
+        )
         return None, None
 
-    print("Обнаружен возможный зонд: freq = %.3f MHz, RSSI ≈ %.1f dBm" %
-          (refined_freq / 1e6, refined_rssi))
+    # Вернём частоту-кандидат и её RSSI
+    track_store.set_rf_status(refine_best_freq, refine_best_rssi)
+    track_store.set_rf_diagnostics(
+        noise_rssi_dbm=noise,
+        signal_threshold_dbm=threshold,
+        lost_counter=0,
+        had_signal=True,
+        mode="scan",
+    )
 
-    return refined_freq, refined_rssi
+    return refine_best_freq, refine_best_rssi

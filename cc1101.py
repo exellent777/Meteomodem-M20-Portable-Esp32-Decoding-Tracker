@@ -18,8 +18,8 @@ READ_SINGLE = 0x80
 READ_BURST  = 0xC0
 
 # ----- Регистры CC1101 -----
+# (имена и адреса взяты из даташита, только минимум нужного)
 REG_IOCFG2   = 0x00
-REG_IOCFG1   = 0x01
 REG_IOCFG0   = 0x02
 REG_FIFOTHR  = 0x03
 REG_SYNC1    = 0x04
@@ -37,22 +37,14 @@ REG_FREQ0    = 0x0F
 REG_MDMCFG4  = 0x10
 REG_MDMCFG3  = 0x11
 REG_MDMCFG2  = 0x12
-REG_MDMCFG1  = 0x13
-REG_MDMCFG0  = 0x14
 REG_DEVIATN  = 0x15
-REG_MCSM2    = 0x16
-REG_MCSM1    = 0x17
 REG_MCSM0    = 0x18
 REG_FOCCFG   = 0x19
 REG_BSCFG    = 0x1A
 REG_AGCCTRL2 = 0x1B
 REG_AGCCTRL1 = 0x1C
 REG_AGCCTRL0 = 0x1D
-REG_WOREVT1  = 0x1E
-REG_WOREVT0  = 0x1F
-REG_WORCTRL  = 0x20
 REG_FREND1   = 0x21
-REG_FREND0   = 0x22
 REG_FSCAL3   = 0x23
 REG_FSCAL2   = 0x24
 REG_FSCAL1   = 0x25
@@ -61,114 +53,100 @@ REG_TEST2    = 0x2C
 REG_TEST1    = 0x2D
 REG_TEST0    = 0x2E
 
-# Статус-регистры
-REG_PARTNUM  = 0x30
-REG_VERSION  = 0x31
-REG_RSSI     = 0x34    # RSSI
+# ----- Регистры статуса (читаются с флагом READ_SINGLE) -----
+REG_RSSI     = 0x34
 REG_MARCSTATE= 0x35
-REG_RXBYTES  = 0x3B    # количество байт в RX FIFO (status reg)
-REG_RXFIFO   = 0x3F    # FIFO
+REG_PKTSTATUS= 0x38
+REG_RXBYTES  = 0x3B
 
-# Кварц у типичных модулей CC1101 — 26 МГц
-XTAL_HZ = 26_000_000
-
-
+# ----- Ошибка приёма -----
 class CC1101ReceiveError(Exception):
-    """Ошибка приёма кадра от CC1101 (таймаут/мусор и т.п.)."""
     pass
 
 
 class CC1101:
-    def __init__(self, sck, mosi, miso, cs, gdo0):
-        # Инициализация SPI
+    def __init__(self, spi_id=1, sck=None, mosi=None, miso=None, cs=None):
+        # Инициализация SPI и пина CS
         self.cs = Pin(cs, Pin.OUT, value=1)
         self.spi = SPI(
-            1,
-            baudrate=4_000_000,
+            spi_id,
+            baudrate=4000000,
             polarity=0,
             phase=0,
             sck=Pin(sck),
             mosi=Pin(mosi),
             miso=Pin(miso),
         )
-        self.gdo0 = Pin(gdo0, Pin.IN)
+        time.sleep_ms(10)
 
-        # Сброс и базовая настройка
+        # Сбрасываем чип и настраиваем его под приём M20
         self.reset()
         self.configure_radio()
 
-        # Для отладки можно выводить part/version
-        try:
-            part = self._read_status(REG_PARTNUM)
-            ver = self._read_status(REG_VERSION)
-            print("CC1101 part=0x%02X ver=0x%02X" % (part, ver))
-        except Exception:
-            pass
+    # ---------------------- Низкоуровневый SPI ----------------------
 
-    # ---------------------- Низкоуровневые операции ----------------------
-
-    def _cs_low(self):
+    def _select(self):
         self.cs.value(0)
+        # Небольшая задержка для надёжности
+        time.sleep_us(5)
 
-    def _cs_high(self):
+    def _deselect(self):
         self.cs.value(1)
+        time.sleep_us(5)
 
     def strobe(self, cmd):
-        """Отправить strobe-команду (SRES/SRX/SIDLE/SFRX...)."""
-        self._cs_low()
+        """Отправка strobe-команды (SRES, SRX, SIDLE, SFRX, и т.д.)"""
+        self._select()
         self.spi.write(bytearray([cmd]))
-        self._cs_high()
+        self._deselect()
 
     def write_reg(self, addr, value):
-        """Запись одного конфигурационного регистра."""
-        self._cs_low()
-        self.spi.write(bytearray([addr & 0x3F]))
-        self.spi.write(bytearray([value & 0xFF]))
-        self._cs_high()
+        """Запись одного регистра."""
+        self._select()
+        self.spi.write(bytearray([addr | WRITE_BURST, value & 0xFF]))
+        self._deselect()
 
     def read_reg(self, addr):
-        """Чтение одного конфигурационного регистра."""
-        self._cs_low()
+        """Чтение одного регистра."""
+        self._select()
         self.spi.write(bytearray([addr | READ_SINGLE]))
-        val = self.spi.read(1)[0]
-        self._cs_high()
-        return val
+        data = self.spi.read(1)
+        self._deselect()
+        return data[0]
 
-    def _read_status(self, addr):
-        """Чтение статус-регистра (RSSI, RXBYTES и т.п.)."""
-        self._cs_low()
+    def read_burst(self, addr, length):
+        """Чтение нескольких байт (например, RX FIFO)."""
+        self._select()
         self.spi.write(bytearray([addr | READ_BURST]))
-        val = self.spi.read(1)[0]
-        self._cs_high()
-        return val
-
-    def burst_read_fifo(self, length):
-        """Чтение нескольких байт из RX FIFO."""
-        self._cs_low()
-        # RX FIFO = 0x3F, читаем в burst-режиме
-        self.spi.write(bytearray([REG_RXFIFO | READ_BURST]))
         data = self.spi.read(length)
-        self._cs_high()
+        self._deselect()
         return data
 
-    def flush_rx(self):
-        """Очистка RX FIFO."""
-        self.strobe(SIDLE)
-        time.sleep_ms(1)
-        self.strobe(SFRX)
-        time.sleep_ms(1)
-
-    # ---------------------- Конфигурация радиочасти ----------------------
+    # ---------------------- Базовые операции ----------------------
 
     def reset(self):
-        """Жёсткий сброс CC1101 (SRES)."""
+        """Аппаратный сброс CC1101."""
         self.strobe(SRES)
         time.sleep_ms(5)
 
+    def enter_rx(self):
+        """Перевод в RX-режим."""
+        self.strobe(SRX)
+
+    def enter_idle(self):
+        """Перевод в IDLE."""
+        self.strobe(SIDLE)
+
+    def flush_rx(self):
+        """Очистить RX FIFO."""
+        self.strobe(SFRX)
+
+    # ---------------------- Настройка под M20 ----------------------
+
     def configure_radio(self):
         """
-        Базовая настройка CC1101 в непрерывный приём сырых байтов.
-        Модем нацелен на приём Meteomodem M20:
+        Базовая конфигурация под приём M20:
+          - 400–406 MHz диапазон (частоту задаём позже отдельно);
           - 2-FSK
           - скорость ~9.6 kbit/s
           - полоса приёма ~100 kHz (чтобы не бояться сдвига по частоте)
@@ -177,62 +155,53 @@ class CC1101:
         self.flush_rx()
 
         # Настройка выводов GDO:
-        # GDO2 / GDO0 — "sync / end of packet", нам достаточно GDO0.
+        #   GDO0/GDO2 в режим 0x0D: Serial Data Output (асинхронный поток RX-данных). GDO0 читаем таймером.
         self.write_reg(REG_IOCFG2, 0x0D)
         self.write_reg(REG_IOCFG0, 0x0D)
 
         # FIFO пороги
         self.write_reg(REG_FIFOTHR, 0x07)
 
-        # Пакетный режим:
-        # используем "бесконечный пакет" (infinite length), чтобы CC1101
-        # не резал поток сам. Границу кадра M20 ищем в Python.
-        self.write_reg(REG_PKTLEN, 0xFF)   # при infinite длине не важно
+        # Пакетный режим: бесконечная длина пакета, CRC выключен.
+        # Границы кадров M20 ищем сами в Python.
+        self.write_reg(REG_PKTLEN, 0xFF)
         self.write_reg(REG_PKTCTRL1, 0x00)
         # PKTCTRL0:
-        #   [1:0] LENGTH_CONFIG = 2 (infinite packet length)
-        #   [2]   CRC_EN = 0 (CRC M20 считаем сами в m20_decoder)
+        #   [1:0] LENGTH_CONFIG = 2 (infinite length)
+        #   [2]   CRC_EN = 0 (CRC считаем сами)
         self.write_reg(REG_PKTCTRL0, 0x02)
 
-        # Частотный синтезатор
-        self.write_reg(REG_FSCTRL1, 0x06)
+        # Номер устройства и канал (не используются в нашем режиме)
+        self.write_reg(REG_ADDR, 0x00)
+        self.write_reg(REG_CHANNR, 0x00)
+
+        # Частотный синтезатор, девиация и пр. (значения подобраны под 400–406 MHz и ~9.6 kbit/s)
+        # Эти регистры можно тонко подстроить под реальный M20 позже.
+        self.write_reg(REG_FSCTRL1, 0x08)   # IF frequency
         self.write_reg(REG_FSCTRL0, 0x00)
 
-        # Параметры модема под M20:
-        #   - 2-FSK, dev ~47 kHz (дефолт DEVIATN 0x47, если нужен)
-        #   - BW ≈ 101 kHz
-        #   - data rate ≈ 9.6 kbit/s
-        #
-        # MDMCFG4:
-        #   [7:6] CHANBW_E = 3
-        #   [5:4] CHANBW_M = 0 → BW ≈ 101 kHz
-        #   [3:0] DRATE_E  = 8
-        # → 0xC8
-        # MDMCFG3:
-        #   DRATE_M = 131 (0x83) → R ≈ 9.6 kbit/s
-        self.write_reg(REG_MDMCFG4, 0xC8)
-        self.write_reg(REG_MDMCFG3, 0x83)
+        # Пример настройки на ~9.6 kbit/s и BW ~100 kHz:
+        self.write_reg(REG_MDMCFG4, 0xCA)   # chan BW и др.
+        self.write_reg(REG_MDMCFG3, 0x83)   # data rate
+        self.write_reg(REG_MDMCFG2, 0x30)   # 2-FSK, sync mode и т.д.
 
-        # Остальные MDMCFG берём типовые
-        # 2-FSK, манчестер-откл, preamble/sync по умолчанию
-        self.write_reg(REG_MDMCFG2, 0x13)
-        self.write_reg(REG_MDMCFG1, 0x22)
-        self.write_reg(REG_MDMCFG0, 0xF8)
+        # Девиация частоты (нужно будет подогнать под M20, сейчас ~47 kHz)
+        self.write_reg(REG_DEVIATN, 0x47)
 
-        # Девиация по умолчанию (можно тюнить позже)
-        # self.write_reg(REG_DEVIATN, 0x47)  # оставим заводское значение
-
-        # Автоматические режимы, частотная/битовая синхронизация, AGC
+        # State machine config
         self.write_reg(REG_MCSM0, 0x18)
         self.write_reg(REG_FOCCFG, 0x16)
-        self.write_reg(REG_BSCFG,  0x6C)
+        self.write_reg(REG_BSCFG, 0x6C)
+
+        # AGC
         self.write_reg(REG_AGCCTRL2, 0x43)
         self.write_reg(REG_AGCCTRL1, 0x40)
         self.write_reg(REG_AGCCTRL0, 0x91)
 
-        # Калибровка и выходной тракт — рекомендованные значения из даташита
+        # Front-end
         self.write_reg(REG_FREND1, 0x56)
-        self.write_reg(REG_FREND0, 0x10)
+
+        # Calibration
         self.write_reg(REG_FSCAL3, 0xE9)
         self.write_reg(REG_FSCAL2, 0x2A)
         self.write_reg(REG_FSCAL1, 0x00)
@@ -241,92 +210,58 @@ class CC1101:
         self.write_reg(REG_TEST1,  0x35)
         self.write_reg(REG_TEST0,  0x09)
 
-        # Установить рабочую частоту
-        self.set_frequency(config.RF_FREQUENCY_HZ)
-
         # Вход в RX режим
         self.enter_rx()
 
+    # ---------------------- Частота и RSSI ----------------------
+
     def set_frequency(self, freq_hz):
         """
-        Установка частоты.
-        Формула из даташита:
-            FREQ = int(freq_hz * 2^16 / f_xtal)
+        Установка рабочей частоты в Hz.
         """
-        if not freq_hz:
-            return
+        # Формулы из даташита:
+        # FREQ = freq_hz * 2^16 / f_ref, где f_ref ~ 26 MHz
+        f_ref = 26_000_000
+        freq_reg = int(freq_hz * (1 << 16) / f_ref) & 0xFFFFFF
 
-        f = int(freq_hz * (1 << 16) // XTAL_HZ)
-        freq2 = (f >> 16) & 0xFF
-        freq1 = (f >> 8) & 0xFF
-        freq0 = f & 0xFF
+        freq2 = (freq_reg >> 16) & 0xFF
+        freq1 = (freq_reg >> 8) & 0xFF
+        freq0 = freq_reg & 0xFF
 
         self.write_reg(REG_FREQ2, freq2)
         self.write_reg(REG_FREQ1, freq1)
         self.write_reg(REG_FREQ0, freq0)
 
-    def enter_rx(self):
-        """Перейти в режим приёма."""
-        self.strobe(SRX)
-
-    # ---------------------- Измерение RSSI ----------------------
+    def read_rssi_raw(self):
+        """Читает сырой RSSI из регистра."""
+        return self.read_reg(REG_RSSI)
 
     def read_rssi_dbm(self):
         """
-        Чтение RSSI в dBm.
-        Формула из даташита:
-            rssi_dec = RSSI_REG (signed, 2's complement)
-            RSSI_dBm = rssi_dec / 2 - RSSI_OFFSET
-        Для 400–433 МГц типичный RSSI_OFFSET ≈ 74.
+        Преобразование RSSI в dBm по примеру из даташита:
+          rssi_dBm = RSSI_DEC/2 - RSSI_OFFSET
         """
-        rssi_reg = self._read_status(REG_RSSI)
-        if rssi_reg >= 128:
-            rssi_dec = rssi_reg - 256
-        else:
-            rssi_dec = rssi_reg
-        rssi_dbm = rssi_dec / 2.0 - 74.0
+        rssi = self.read_rssi_raw()
+        # RSSI представляется как signed int8
+        if rssi >= 128:
+            rssi -= 256
+        # RSSI_OFFSET по даташиту обычно ~74
+        rssi_dbm = rssi / 2.0 - 74
         return rssi_dbm
 
-    # ---------------------- Приём кадра ----------------------
+    # ---------------------- Чтение RX FIFO (если понадобится) ----------------------
 
-    def receive_frame(self, expected_len=None, timeout_ms=500):
+    def read_rx_fifo(self, max_len=64):
         """
-        Считать кусок байтов из RX FIFO фиксированной длины expected_len.
-
-        expected_len — сколько байт хотим прочитать из «бесконечного» потока
-                       (по умолчанию config.M20_FRAME_LEN).
-        timeout_ms   — таймаут ожидания.
-
-        При успехе:
-            возвращает bytes длиной expected_len
-        При таймауте или ошибке:
-            поднимает CC1101ReceiveError.
+        Чтение данных из RX FIFO. Здесь мы им почти не пользуемся,
+        т.к. для M20 планируем читать сырые биты с GDO0.
         """
-        if expected_len is None:
-            expected_len = config.M20_FRAME_LEN
+        rxbytes = self.read_reg(REG_RXBYTES) & 0x7F
+        if rxbytes == 0:
+            raise CC1101ReceiveError("RX FIFO empty")
 
-        self.flush_rx()
-        self.enter_rx()
-
-        buf = bytearray()
-        t_start = time.ticks_ms()
-
-        while time.ticks_diff(time.ticks_ms(), t_start) < timeout_ms:
-            # Сколько байт в RX FIFO
-            rxbytes = self._read_status(REG_RXBYTES) & 0x7F
-            if rxbytes > 0:
-                to_read = min(rxbytes, expected_len - len(buf))
-                if to_read > 0:
-                    chunk = self.burst_read_fifo(to_read)
-                    buf.extend(chunk)
-
-                    if len(buf) >= expected_len:
-                        # получили нужный объём данных
-                        self.flush_rx()
-                        return bytes(buf[:expected_len])
-
-            time.sleep_ms(5)
-
-        # Таймаут
-        self.flush_rx()
-        raise CC1101ReceiveError("Timeout waiting for frame")
+        to_read = min(rxbytes, max_len)
+        data = self.read_burst(0x3F, to_read)  # 0x3F = FIFO
+        if not data:
+            raise CC1101ReceiveError("no data from RX FIFO")
+        return data

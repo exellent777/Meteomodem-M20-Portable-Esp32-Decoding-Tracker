@@ -15,17 +15,43 @@ except ImportError:
 # Последние данные зонда (последний успешно декодированный пакет)
 latest = SondeData()
 
-# История полёта (список точек). Для простоты храним кортежи (t, lat, lon, alt).
+# Трек (список SondeData с позицией)
 track = []
 
-# Максимальное количество точек в треке
-MAX_TRACK_POINTS = 500
+# -----------------------------
+# Статус радиочасти
+# -----------------------------
 
+# Последняя известная частота приёма (Hz) и RSSI (dBm)
+rf_frequency_hz = None
+rf_rssi_dbm = None
+
+# Диагностика RF: шум, порог, счётчик потерь и т.п.
+rf_noise_rssi_dbm = None
+rf_signal_threshold_dbm = None
+rf_lost_counter = 0
+rf_had_signal = False
+rf_mode = "idle"  # idle / scan / validate / tracking
+
+# Режим управления приёмником:
+#   "auto_scan"  — приёмник сам сканирует диапазон (основной режим);
+#   "fixed_freq" — частота зафиксирована пользователем через Web UI.
+rf_control_mode = "auto_scan"
+
+# Если fixed_freq_hz не None — приёмник должен слушать только эту частоту.
+fixed_freq_hz = None
+
+# Флаг «нужно перезапустить поиск» (устанавливается из Web UI)
+need_restart = False
+
+
+# -----------------------------
+# API для main.py и web_ui.py
+# -----------------------------
 
 def update_latest(data: SondeData) -> None:
     """
-    Обновить объект latest целиком.
-    Вызывается из main.py после успешного декодирования кадра.
+    Обновить структуру latest последним пакетом.
     """
     global latest
     latest = data
@@ -33,66 +59,64 @@ def update_latest(data: SondeData) -> None:
 
 def append_track(data: SondeData) -> None:
     """
-    Добавить точку в трек. Храним с ограничением по длине.
+    Добавить точку в трек.
     """
     global track
-    if data is None:
-        return
-    t = getattr(data, "time", None) or 0
-    lat = getattr(data, "lat", None)
-    lon = getattr(data, "lon", None)
-    alt = getattr(data, "alt", None)
-    track.append((t, lat, lon, alt))
-    if len(track) > MAX_TRACK_POINTS:
-        track = track[-MAX_TRACK_POINTS:]
+    track.append(data)
 
 
 def clear_track() -> None:
     """
-    Очистить историю трека.
+    Очистить трек (например, при перезапуске поиска).
     """
     global track
     track = []
 
 
-# -----------------------------
-# Статус радиочасти (текущая частота, RSSI)
-# -----------------------------
+def get_latest() -> SondeData:
+    """
+    Вернуть последний пакет.
+    """
+    return latest
 
-# Текущая частота приёмника (Гц) и последний RSSI (dBm)
-rf_freq_hz = None
-rf_rssi_dbm = None
 
+def get_track():
+    """
+    Вернуть текущий трек (список SondeData).
+    """
+    return track
+
+
+# -----------------------------
+# RF-статус
+# -----------------------------
 
 def set_rf_status(freq_hz, rssi_dbm) -> None:
     """
-    Вызывается из main.py/afc.py для обновления текущей частоты и RSSI.
+    Устанавливает последнюю известную частоту и RSSI.
+    Это используется Web UI для отображения «куда сейчас смотрит» приёмник.
     """
-    global rf_freq_hz, rf_rssi_dbm
-    rf_freq_hz = freq_hz
+    global rf_frequency_hz, rf_rssi_dbm
+    rf_frequency_hz = freq_hz
     rf_rssi_dbm = rssi_dbm
 
 
-# -----------------------------
-# Диагностика радиочасти (режим, шум, порог, счётчик потерь)
-# -----------------------------
-
-rf_mode = "idle"                # "init" / "search" / "tracking" / "lost"
-rf_noise_rssi_dbm = None        # оценка шумового уровня
-rf_signal_threshold_dbm = None  # порог "есть сигнал"
-rf_lost_counter = 0             # сколько слабых/пустых циклов подряд
-rf_had_signal = False           # был ли когда-то уверенный сигнал
+def get_rf_status():
+    """
+    Возвращает (freq_hz, rssi_dbm).
+    """
+    return rf_frequency_hz, rf_rssi_dbm
 
 
 def set_rf_diagnostics(
-    noise_rssi_dbm,
-    signal_threshold_dbm,
-    lost_counter,
-    had_signal,
-    mode,
+    noise_rssi_dbm=None,
+    signal_threshold_dbm=None,
+    lost_counter=0,
+    had_signal=False,
+    mode="idle",
 ) -> None:
     """
-    Вызывается из main.py, чтобы обновить расширенную диагностику радиочасти.
+    Устанавливает диагностические параметры радиочасти.
     """
     global rf_noise_rssi_dbm, rf_signal_threshold_dbm
     global rf_lost_counter, rf_had_signal, rf_mode
@@ -104,56 +128,47 @@ def set_rf_diagnostics(
     rf_mode = mode
 
 
-# -----------------------------
-# Режим управления поиском: SCAN vs FIXED
-# -----------------------------
-
-# По умолчанию используем сканирование диапазона
-rf_control_mode = "scan"  # "scan" или "fixed"
-
-# Фиксированная частота, на которую садимся в режиме FIXED
-if config is not None and hasattr(config, "RF_FREQUENCY_HZ"):
-    rf_fixed_freq_hz = config.RF_FREQUENCY_HZ
-else:
-    rf_fixed_freq_hz = None
-
-
-def set_rf_control_mode(mode: str, fixed_freq_hz=None) -> None:
+def get_rf_diagnostics():
     """
-    Установить режим поиска:
-      - "scan"  — автоматически сканировать диапазон (afc.scan_band)
-      - "fixed" — сидим на одной частоте (rf_fixed_freq_hz)
-    При смене режима можно (опционально) поднимать флаг need_restart, чтобы главный
-    цикл переинициализировал состояние.
+    Возвращает диагностические параметры радиочасти.
     """
-    global rf_control_mode, rf_fixed_freq_hz, need_restart
+    return {
+        "noise_rssi_dbm": rf_noise_rssi_dbm,
+        "signal_threshold_dbm": rf_signal_threshold_dbm,
+        "lost_counter": rf_lost_counter,
+        "had_signal": rf_had_signal,
+        "mode": rf_mode,
+    }
 
-    if mode not in ("scan", "fixed"):
-        mode = "scan"
+
+# -----------------------------
+# Режим управления частотой (auto_scan / fixed_freq)
+# -----------------------------
+
+def set_rf_control_mode(mode: str, freq_hz: int | None = None) -> None:
+    """
+    Устанавливает режим управления частотой.
+      - mode = "auto_scan": частота определяется автоматически (AFC/scan_band);
+      - mode = "fixed_freq": частота фиксируется на freq_hz.
+    """
+    global rf_control_mode, fixed_freq_hz
+    if mode not in ("auto_scan", "fixed_freq"):
+        raise ValueError("Unknown rf_control_mode: %r" % (mode,))
 
     rf_control_mode = mode
-
-    if fixed_freq_hz is not None:
-        rf_fixed_freq_hz = fixed_freq_hz
-
-    # Попросим главный цикл начать поиск заново с новым режимом
-    need_restart = True
+    fixed_freq_hz = freq_hz if mode == "fixed_freq" else None
 
 
 def get_rf_control_mode():
     """
-    Вернуть (режим, фиксированная_частота).
-    Удобно вызывать из main.py и web_ui.py.
+    Возвращает (mode, fixed_freq_hz).
     """
-    return rf_control_mode, rf_fixed_freq_hz
+    return rf_control_mode, fixed_freq_hz
 
 
 # -----------------------------
-# Флаг «перезапустить поиск» из Web UI
+# Флаг перезапуска поиска
 # -----------------------------
-
-need_restart = False
-
 
 def request_restart() -> None:
     """
@@ -171,3 +186,32 @@ def clear_restart() -> None:
     """
     global need_restart
     need_restart = False
+
+
+# -----------------------------
+# Дополнительные обёртки для main.py
+# -----------------------------
+
+def reset_all() -> None:
+    """Полный сброс состояния трекера (последний пакет и трек).
+    Вызывается из main.py при старте и при возврате в режим SCAN."""
+    global latest, track
+    latest = SondeData()
+    track = []
+
+
+def get_restart_requested() -> bool:
+    """Удобная обёртка для main.py: проверить, запрошен ли перезапуск поиска."""
+    return need_restart
+
+
+def clear_restart_request() -> None:
+    """Сбрасывает флаг перезапуска поиска (обёртка над clear_restart)."""
+    clear_restart()
+
+
+def update_track_from_m20(data: SondeData) -> None:
+    """Обновление последнего пакета и добавление точки в трек.
+    Вызывается из main.py после успешного декода M20."""
+    update_latest(data)
+    append_track(data)

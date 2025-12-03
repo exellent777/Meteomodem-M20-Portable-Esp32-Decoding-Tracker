@@ -1,84 +1,117 @@
-# m20_decoder.py — декодер кадров M20
+# m20_decoder.py — декодер кадров M20 по мотивам m20mod.c
 # Совместим с:
-#   main.py (использует decode_m20(buffers))
-#   gdo0_bitstream.py (даёт список буферов со сдвигами)
+#   main.py (вызывает decode_m20(buffers))
+#   gdo0_bitstream.py (даёт список байтовых буферов разных битовых фаз)
 #   sonde_data.py (получает полный кадр для парсинга)
 
 import gc
 
-# Примерная синхрометка M20 — здесь достаточно сигнатуры для поиска
-SYNC = b"\x55\x55\x55\x56"   # типичный паттерн преамбулы+sync
-
-# Минимальная длина кадра (в байтах), чтобы имело смысл считать CRC.
-# С учётом sync, полезной нагрузки и CRC.
-MIN_FRAME_LEN = 40
-
-# Диапазон длин кадра, по которому будем искать корректный CRC.
-# Мы не знаем точную длину, поэтому перебираем разумное окно.
-FRAME_LEN_MIN = 40
-FRAME_LEN_MAX = 80
-
-CRC_POLY = 0x1021
+TYPE_M20 = 0x20  # тип кадра M20
 
 
-def crc16(data: bytes) -> int:
-    """CRC-16/X.25 (как в большинстве реализаций M20)."""
-    crc = 0xFFFF
-    for b in data:
-        crc ^= (b << 8)
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ CRC_POLY) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
-    return crc
-
-
-def _find_sync(buf: bytes, start: int = 0) -> int:
-    """Поиск sync-последовательности в буфере, начиная с позиции start.
-    Возвращает индекс или -1, если не найдено.
+# -----------------------------
+# Специальный checksum M10/M20
+# (update_checkM10 / checkM10 из m20mod.c)
+# -----------------------------
+def update_checkM10(c, b):
     """
-    try:
-        return buf.index(SYNC, start)
-    except ValueError:
-        return -1
-
-
-def _try_decode_from(buf, si):
-    """Пробует найти валидный кадр, начиная с позиции sync (si).
-
-    Мы НЕ берём весь хвост до конца буфера, а перебираем возможные длины
-    кадра в диапазоне [FRAME_LEN_MIN, FRAME_LEN_MAX] и для каждого варианта
-    считаем CRC по data[:-2].
+    Порт функции update_checkM10(int c, ui8_t b) из m20mod.c.
+    c: 16-битное состояние (int)
+    b: байт (0..255)
     """
-    max_len = min(FRAME_LEN_MAX, len(buf) - si)
+    c &= 0xFFFF
+    b &= 0xFF
 
-    # Слишком короткий хвост — нечего декодировать
-    if max_len < MIN_FRAME_LEN:
+    c1 = c & 0xFF
+
+    # B
+    b = ((b >> 1) | ((b & 1) << 7)) & 0xFF
+    b ^= (b >> 2) & 0xFF
+
+    # A1
+    t6 = (c & 1) ^ ((c >> 2) & 1) ^ ((c >> 4) & 1)
+    t7 = ((c >> 1) & 1) ^ ((c >> 3) & 1) ^ ((c >> 5) & 1)
+    t = (c & 0x3F) | (t6 << 6) | (t7 << 7)
+
+    # A2
+    s = (c >> 7) & 0xFF
+    s ^= (s >> 2) & 0xFF
+
+    c0 = b ^ t ^ s
+    return ((c1 << 8) | c0) & 0xFFFF
+
+
+def checkM10(data, length):
+    """
+    Порт функции checkM10(ui8_t *msg, int len):
+        cs = 0;
+        for (i=0; i<len; i++)
+            cs = update_checkM10(cs, msg[i]);
+        return cs & 0xFFFF;
+    """
+    cs = 0
+    for i in range(length):
+        cs = update_checkM10(cs, data[i])
+    return cs & 0xFFFF
+
+
+# -----------------------------
+# Поиск кадра в одном буфере
+# -----------------------------
+def _find_frame_in_buffer(buf):
+    """
+    Ищет в buf корректный кадр M20:
+    - первый байт = длина flen (ожидаем 0x45 или 0x43)
+    - второй байт = тип 0x20
+    - checksum по алгоритму M10/M20 совпадает
+    Возвращает frame (bytes) либо None.
+    """
+    n = len(buf)
+    if n < 16:
         return None
 
-    for flen in range(FRAME_LEN_MIN, max_len + 1):
-        frame = buf[si : si + flen]
-        if len(frame) < MIN_FRAME_LEN:
-            continue
-        if len(frame) < 4:
+    # Перебираем все возможные позиции начала кадра
+    for start in range(0, n - 6):
+        flen = buf[start]
+
+        # Разумные рамки длины: M20 использует 0x45 (иногда 0x43)
+        if flen not in (0x45, 0x43):
             continue
 
-        data = frame[:-2]
-        recv_crc = (frame[-2] << 8) | frame[-1]
-        calc_crc = crc16(data)
+        # В буфере должен быть как минимум flen+1 байт (данные + 2 байта chk)
+        frame_total_len = flen + 1  # как в m20mod: len(block+chk16) = flen
+        if start + frame_total_len > n:
+            continue
 
-        if calc_crc == recv_crc:
-            # Нашли консистентный кадр
+        # Проверяем тип
+        ftype = buf[start + 1]
+        if ftype != TYPE_M20:
+            continue
+
+        frame = buf[start : start + frame_total_len]
+
+        # Позиция checksum: pos_check = flen-1 (как в m20mod)
+        pos_check = flen - 1
+        if pos_check + 1 >= len(frame):
+            continue
+
+        recv_crc = (frame[pos_check] << 8) | frame[pos_check + 1]
+        calc_crc = checkM10(frame, pos_check)
+
+        if recv_crc == calc_crc:
             return frame
 
     return None
 
 
+# -----------------------------
+# Внешний интерфейс
+# -----------------------------
 def decode_m20(buffers):
-    """Принимает список bytes-буферов (разные битовые сдвиги),
-    ищет в них sync + валидный CRC на разумной длине кадра.
-    Возвращает полный кадр (bytes), начинающийся с sync, либо None.
+    """
+    Принимает список bytes-буферов (разные битовые сдвиги),
+    ищет в них кадр M20 по параметрам (len/type) и checksum.
+    Возвращает полный кадр (bytes) либо None.
     """
     if not buffers:
         return None
@@ -89,21 +122,10 @@ def decode_m20(buffers):
         pass
 
     for bbuf in buffers:
-        if not bbuf or len(bbuf) < MIN_FRAME_LEN:
+        if not bbuf:
             continue
-
-        # В одном буфере может быть несколько sync — перебираем все.
-        pos = 0
-        while True:
-            si = _find_sync(bbuf, pos)
-            if si < 0:
-                break
-
-            frame = _try_decode_from(bbuf, si)
-            if frame is not None:
-                return frame
-
-            # Продолжаем поиск следующей sync внутри того же буфера
-            pos = si + 1
+        frame = _find_frame_in_buffer(bbuf)
+        if frame is not None:
+            return frame
 
     return None

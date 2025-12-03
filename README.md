@@ -21,7 +21,7 @@ All configuration and decoding runs entirely on the ESP32; no external computer 
 * Software oversampling and bit-timing recovery on the GDO0 bitstream
 * M20 frame detection with sync search, proper frame length window and CRC-16/X.25 check
 * Strict frequency validation: several valid CRC frames required before entering tracking mode
-* Automatic scan over 404–406 MHz with re-scan if the signal is lost
+* Automatic scan over 400–406 MHz with re-scan if the signal is lost
 * Fixed-frequency mode for manual tracking or testing
 * Lightweight Web UI (HTML + JS) for configuration and live telemetry display
 

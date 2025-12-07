@@ -1,23 +1,27 @@
-# m20_decoder.py — декодер кадров M20 по мотивам m20mod.c
-# Совместим с:
-#   main.py (вызывает decode_m20(buffers))
-#   gdo0_bitstream.py (даёт список байтовых буферов разных битовых фаз)
-#   sonde_data.py (получает полный кадр для парсинга)
+# m20_decoder.py — декодер кадров M20 для M20 Tracker
+#
+# Вход:
+#   decode_m20(buffers)
+#     buffers — список байтовых кадров-кандидатов (bytes), как возвращает
+#               gdo0_bitstream.bits_to_bytes().
+#
+# Задача:
+#   - проверить базовую сигнатуру (0x45 0x20)
+#   - посчитать CRC так же, как в M10/M20-декодере (update_checkM10M20 / crc_M10M20)
+#   - использовать длину кадра из первого байта (frame[0] + 1)
+#   - вернуть первый валидный кадр (bytes) или None.
 
 import gc
 
-TYPE_M20 = 0x20  # тип кадра M20
+TYPE_M20 = 0x20      # тип кадра для M20
+MIN_LEN  = 40        # минимальная разумная длина (байт)
+MAX_LEN  = 100       # чтобы отсеивать откровенный мусор
 
 
-# -----------------------------
-# Специальный checksum M10/M20
-# (update_checkM10 / checkM10 из m20mod.c)
-# -----------------------------
-def update_checkM10(c, b):
+def update_checkM10M20(c, b):
     """
-    Порт функции update_checkM10(int c, ui8_t b) из m20mod.c.
-    c: 16-битное состояние (int)
-    b: байт (0..255)
+    Порт функции update_checkM10M20 из M10M20.cpp.
+
     """
     c &= 0xFFFF
     b &= 0xFF
@@ -25,11 +29,11 @@ def update_checkM10(c, b):
     c1 = c & 0xFF
 
     # B
-    b = ((b >> 1) | ((b & 1) << 7)) & 0xFF
+    b = ((b >> 1) | ((b & 0x01) << 7)) & 0xFF
     b ^= (b >> 2) & 0xFF
 
     # A1
-    t6 = (c & 1) ^ ((c >> 2) & 1) ^ ((c >> 4) & 1)
+    t6 = ((c >> 0) & 1) ^ ((c >> 2) & 1) ^ ((c >> 4) & 1)
     t7 = ((c >> 1) & 1) ^ ((c >> 3) & 1) ^ ((c >> 5) & 1)
     t = (c & 0x3F) | (t6 << 6) | (t7 << 7)
 
@@ -37,95 +41,113 @@ def update_checkM10(c, b):
     s = (c >> 7) & 0xFF
     s ^= (s >> 2) & 0xFF
 
-    c0 = b ^ t ^ s
+    c0 = (b ^ t ^ s) & 0xFF
+
     return ((c1 << 8) | c0) & 0xFFFF
 
 
-def checkM10(data, length):
+def crc_M10M20(buf, length):
     """
-    Порт функции checkM10(ui8_t *msg, int len):
-        cs = 0;
-        for (i=0; i<len; i++)
-            cs = update_checkM10(cs, msg[i]);
-        return cs & 0xFFFF;
+    crc_M10M20(int len, uint8_t *msg)
+
+    uint16_t cs = 0;
+    for (int i = 0; i < len; i++) {
+        cs = update_checkM10M20(cs, msg[i]);
+    }
+    return cs;
     """
     cs = 0
+    if length <= 0:
+        return 0
+
+    if length > len(buf):
+        length = len(buf)
+
     for i in range(length):
-        cs = update_checkM10(cs, data[i])
+        cs = update_checkM10M20(cs, buf[i])
+
     return cs & 0xFFFF
 
 
-# -----------------------------
-# Поиск кадра в одном буфере
-# -----------------------------
-def _find_frame_in_buffer(buf):
+def checkM10M20crc(crcpos, frame):
     """
-    Ищет в buf корректный кадр M20:
-    - первый байт = длина flen (ожидаем 0x45 или 0x43)
-    - второй байт = тип 0x20
-    - checksum по алгоритму M10/M20 совпадает
-    Возвращает frame (bytes) либо None.
+    checkM10M20crc(int crcpos, uint8_t *msg):
+
+        uint16_t cs, cs1;
+        cs = crc_M10M20(crcpos, msg);
+        cs1 = (msg[crcpos] << 8) | msg[crcpos+1];
+        return (cs1 == cs);
     """
-    n = len(buf)
-    if n < 16:
-        return None
+    # crcpos — позиция старшего байта CRC
+    if crcpos < 0:
+        return False
+    if crcpos + 1 >= len(frame):
+        return False
 
-    # Перебираем все возможные позиции начала кадра
-    for start in range(0, n - 6):
-        flen = buf[start]
-
-        # Разумные рамки длины: M20 использует 0x45 (иногда 0x43)
-        if flen not in (0x45, 0x43):
-            continue
-
-        # В буфере должен быть как минимум flen+1 байт (данные + 2 байта chk)
-        frame_total_len = flen + 1  # как в m20mod: len(block+chk16) = flen
-        if start + frame_total_len > n:
-            continue
-
-        # Проверяем тип
-        ftype = buf[start + 1]
-        if ftype != TYPE_M20:
-            continue
-
-        frame = buf[start : start + frame_total_len]
-
-        # Позиция checksum: pos_check = flen-1 (как в m20mod)
-        pos_check = flen - 1
-        if pos_check + 1 >= len(frame):
-            continue
-
-        recv_crc = (frame[pos_check] << 8) | frame[pos_check + 1]
-        calc_crc = checkM10(frame, pos_check)
-
-        if recv_crc == calc_crc:
-            return frame
-
-    return None
+    cs = crc_M10M20(frame, crcpos)
+    cs1 = ((frame[crcpos] << 8) | frame[crcpos + 1]) & 0xFFFF
+    return cs1 == cs
 
 
-# -----------------------------
-# Внешний интерфейс
-# -----------------------------
+def _frame_looks_like_m20(frame):
+    """
+    Быстрая фильтрация мусора до CRC.
+
+    M20:
+      frame[0] ≈ длина (0x45 для основной посылки)
+      frame[1] = 0x20 (тип кадра)
+    """
+    if not frame or len(frame) < 4:
+        return False
+
+    # Тип кадра
+    if frame[1] != TYPE_M20:
+        return False
+
+    fl = frame[0]
+    # Не даём длине выходить за пределы разумного
+    if fl < MIN_LEN or fl > MAX_LEN:
+        return False
+
+    return True
+
+
 def decode_m20(buffers):
     """
-    Принимает список bytes-буферов (разные битовые сдвиги),
-    ищет в них кадр M20 по параметрам (len/type) и checksum.
-    Возвращает полный кадр (bytes) либо None.
+    Перебирает все кадры-кандидаты и ищет первый с корректной M10/M20-CRC.
+
+    Логика максимально близка к decodeframeM20 в M10M20.cpp:
+      - фактическая длина берётся как (frame[0] + 1),
+      - CRC считается по байтам 0 .. (frl-3),
+      - сравнение идёт с frame[frl-2], frame[frl-1].
+
+    Возвращает bytes(кадр) или None.
     """
+    gc.collect()
+
     if not buffers:
         return None
 
-    try:
-        gc.collect()
-    except Exception:
-        pass
-
-    for bbuf in buffers:
-        if not bbuf:
+    for frame in buffers:
+        if not frame:
             continue
-        frame = _find_frame_in_buffer(bbuf)
-        if frame is not None:
-            return frame
+
+        f = bytes(frame)
+
+        if not _frame_looks_like_m20(f):
+            continue
+
+        # Фактическая длина кадра (как в TTGO: frl = data[0] + 1)
+        frl = f[0] + 1
+        if frl > len(f):
+            frl = len(f)
+
+        crcpos = frl - 2
+        if crcpos <= 0:
+            continue
+
+        if checkM10M20crc(crcpos, f):
+            # Возвращаем кадр, обрезанный до фактической длины
+            return f[:frl]
 
     return None

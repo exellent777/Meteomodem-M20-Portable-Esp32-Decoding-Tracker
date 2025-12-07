@@ -1,8 +1,9 @@
-# web_ui.py — живой Web UI для M20 Tracker
+# web_ui.py — Web UI для M20 Tracker
 # - Живое обновление через /status (JS fetch)
 # - Умный ввод частоты (405.400 / 405400 / 405400000)
-# - Чёткий статус: SCAN / FIXED
-# - Полная частота в Гц и МГц
+# - Статус SCAN / FIXED
+# - RF-мониторинг
+# - Leaflet-карта с последними координатами
 
 import socket
 import time
@@ -24,6 +25,16 @@ PAGE = """\
 <head>
 <meta charset="utf-8">
 <title>M20 Tracker</title>
+
+<!-- Leaflet CSS/JS с CDN (загружается браузером, а не ESP32) -->
+<link
+  rel="stylesheet"
+  href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+/>
+<script
+  src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js">
+</script>
+
 <style>
 body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
@@ -106,7 +117,17 @@ button.secondary {
     min-width: 220px;
     padding-right: 10px;
 }
+
+/* Карта */
+#map {
+    width: 100%;
+    height: 260px;
+    border-radius: 8px;
+    margin-top: 8px;
+    overflow: hidden;
+}
 </style>
+
 <script>
 function fmt(v, digits) {
     if (v === null || v === undefined) return "—";
@@ -115,6 +136,36 @@ function fmt(v, digits) {
         return v.toString();
     }
     return v;
+}
+
+let g_map = null;
+let g_marker = null;
+
+function initMap() {
+    try {
+        g_map = L.map('map').setView([0, 0], 2);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 18,
+        }).addTo(g_map);
+    } catch (e) {
+        console.log("Leaflet init error:", e);
+    }
+}
+
+function updateMap(lat, lon) {
+    if (lat === null || lon === null) return;
+    if (isNaN(lat) || isNaN(lon)) return;
+
+    if (!g_map) {
+        initMap();
+    }
+    const pos = [lat, lon];
+    if (!g_marker) {
+        g_marker = L.marker(pos).addTo(g_map);
+        g_map.setView(pos, 8);
+    } else {
+        g_marker.setLatLng(pos);
+    }
 }
 
 async function refreshStatus() {
@@ -157,8 +208,14 @@ async function refreshStatus() {
         document.getElementById("temp").innerText      = fmt(j.temp, 2);
         document.getElementById("hum").innerText       = fmt(j.humidity, 1);
         document.getElementById("bat").innerText       = fmt(j.battery, 0);
+
+        // Обновить карту
+        if (j.lat !== null && j.lon !== null) {
+            updateMap(j.lat, j.lon);
+        }
     } catch (e) {
         // тихо игнорируем сетевые ошибки
+        console.log("status error", e);
     }
 }
 
@@ -175,6 +232,7 @@ async function setScan() {
 }
 
 window.onload = function () {
+    initMap();
     refreshStatus();
     setInterval(refreshStatus, 1000);
 };
@@ -240,6 +298,9 @@ window.onload = function () {
       <b>Батарея:</b> <span id="bat">—</span> мВ<br>
     </div>
   </div>
+
+  <!-- Карта с последними координатами -->
+  <div id="map"></div>
 </div>
 
 </div>

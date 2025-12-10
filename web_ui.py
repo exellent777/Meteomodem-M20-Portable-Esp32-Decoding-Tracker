@@ -1,461 +1,209 @@
-# web_ui.py — Web UI для M20 Tracker
-# - Живое обновление через /status (JS fetch)
-# - Умный ввод частоты (405.400 / 405400 / 405400000)
-# - Статус SCAN / FIXED
-# - RF-мониторинг
-# - Leaflet-карта с последними координатами
-
+# web_ui.py — расширенный Web UI для M20 трекера (MicroPython ESP32-C3)
 import socket
+import ujson as json
 import time
-import config
-from track_store import track
-from sonde_data import sonde
-
-try:
-    import ujson as json
-except ImportError:
-    import json
 
 
-# ------------------------------------------------------
-# HTML-страница (отдаётся один раз, дальше всё делает JS)
-# ------------------------------------------------------
-PAGE = """\
-<html>
-<head>
-<meta charset="utf-8">
-<title>M20 Tracker</title>
+PAGE = (
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/html\r\n\r\n"
+    "<html><head><meta charset='utf-8'><title>M20 Tracker</title></head>"
+    "<body style='font-family:sans-serif;background:#f4f4f4'>"
+    "<h2>M20 Tracker</h2>"
 
-<!-- Leaflet CSS/JS с CDN (загружается браузером, а не ESP32) -->
-<link
-  rel="stylesheet"
-  href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-/>
-<script
-  src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js">
-</script>
+    "<div style='background:white;padding:10px;border-radius:8px;margin-bottom:10px;'>"
+    "<h3>Состояние</h3>"
+    "<div id='state'>State: —</div>"
+    "<div id='mode_fixed'>FIXED: —</div>"
+    "<div id='freq'>Freq: —</div>"
+    "<div id='afc_conf'>AFC confirmed: —</div>"
+    "<div id='afc_streak'>AFC streak: —</div>"
+    "</div>"
 
-<style>
-body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-    background: #181a1f;
-    color: #e0e0e0;
-    margin: 0;
-    padding: 0;
-}
-.header {
-    padding: 12px 18px;
-    background: #20232a;
-    border-bottom: 1px solid #30343c;
-}
-.header h2 {
-    margin: 0;
-}
-.container {
-    padding: 10px;
-}
-.card {
-    background: #20232a;
-    padding: 12px 14px;
-    margin: 10px 0;
-    border-radius: 8px;
-    box-shadow: 0 0 6px rgba(0,0,0,0.4);
-}
-h3 {
-    margin-top: 0;
-}
-label {
-    display: inline-block;
-    min-width: 150px;
-}
-input {
-    font-size: 16px;
-    padding: 4px 6px;
-    border-radius: 4px;
-    border: 1px solid #444;
-    background: #111;
-    color: #eee;
-}
-button {
-    font-size: 15px;
-    padding: 5px 10px;
-    margin-left: 4px;
-    border-radius: 4px;
-    border: 1px solid #555;
-    background: #2b5fd9;
-    color: #fff;
-}
-button.secondary {
-    background: #444;
-}
-.status-pill {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 999px;
-    font-size: 13px;
-    margin-left: 6px;
-}
-.status-fixed {
-    background: #2b5fd9;
-}
-.status-scan {
-    background: #ffaa33;
-}
-.status-bad {
-    background: #aa3333;
-}
-.good { color: #55ff55; }
-.bad  { color: #ff5555; }
-.mid  { color: #ffd966; }
-.mono { font-family: "SF Mono", "Consolas", "Menlo", monospace; }
-.row {
-    display: flex;
-    flex-wrap: wrap;
-}
-.col {
-    flex: 1;
-    min-width: 220px;
-    padding-right: 10px;
-}
+    "<div style='background:white;padding:10px;border-radius:8px;margin-bottom:10px;'>"
+    "<h3>Радио</h3>"
+    "<div id='rssi'>RSSI: —</div>"
+    "<div id='raw_rssi'>Raw RSSI: —</div>"
+    "<div id='noise'>Noise: —</div>"
+    "<div id='snr'>SNR: —</div>"
+    "<div id='signal'>Signal: —</div>"
+    "<div id='freqest'>FREQEST/Δf: —</div>"
+    "</div>"
 
-/* Карта */
-#map {
-    width: 100%;
-    height: 260px;
-    border-radius: 8px;
-    margin-top: 8px;
-    overflow: hidden;
-}
-</style>
+    "<div style='background:white;padding:10px;border-radius:8px;margin-bottom:10px;'>"
+    "<h3>Кадры M20</h3>"
+    "<div id='frames'>Frames: —</div>"
+    "<div id='sync_hits'>Sync hits: —</div>"
+    "<div id='last_shift'>Last valid shift: —</div>"
+    "<div id='last_age'>Last frame age: —</div>"
+    "</div>"
 
-<script>
-function fmt(v, digits) {
-    if (v === null || v === undefined) return "—";
-    if (typeof v === "number") {
-        if (digits !== undefined) return v.toFixed(digits);
-        return v.toString();
-    }
-    return v;
-}
+    "<div style='background:white;padding:10px;border-radius:8px;margin-bottom:10px;'>"
+    "<h3>Телеметрия</h3>"
+    "<div id='lat'>lat: —</div>"
+    "<div id='lon'>lon: —</div>"
+    "<div id='alt'>alt: —</div>"
+    "<div id='batt'>Vbat: —</div>"
+    "</div>"
 
-let g_map = null;
-let g_marker = null;
+    "<div style='background:white;padding:10px;border-radius:8px;margin-bottom:10px;'>"
+    "<h3>Управление частотой (FIXED)</h3>"
+    "<form action='/set?' method='GET'>"
+    "<input name='f' placeholder='405400000 или 405.4M или 405400k' size='32'>"
+    "<input type='submit' value='SET FIXED'>"
+    "</form>"
+    "<br>"
+    "<a href='/clear'>Сброс FIXED (SCAN)</a>"
+    "</div>"
 
-function initMap() {
-    try {
-        g_map = L.map('map').setView([0, 0], 2);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            maxZoom: 18,
-        }).addTo(g_map);
-    } catch (e) {
-        console.log("Leaflet init error:", e);
-    }
-}
+    "<script>"
+    "async function upd(){"
+    " try{"
+    "  let r = await fetch('/status');"
+    "  let j = await r.json();"
+    "  document.getElementById('state').innerText = 'State: ' + j.state;"
+    "  document.getElementById('mode_fixed').innerText = 'FIXED: ' + (j.fixed ? 'YES' : 'NO');"
+    "  document.getElementById('freq').innerText = 'Freq: ' + j.freq + ' Hz';"
+    "  document.getElementById('afc_conf').innerText = 'AFC confirmed: ' + (j.afc_conf || '—');"
+    "  document.getElementById('afc_streak').innerText = 'AFC streak: ' + j.afc_streak;"
 
-function updateMap(lat, lon) {
-    if (lat === null || lon === null) return;
-    if (isNaN(lat) || isNaN(lon)) return;
+    "  document.getElementById('rssi').innerText = 'RSSI: ' + (j.rssi === null ? '—' : j.rssi.toFixed(1) + ' dBm');"
+    "  document.getElementById('raw_rssi').innerText = 'Raw RSSI: ' + (j.raw_rssi === null ? '—' : j.raw_rssi.toFixed(1) + ' dBm');"
+    "  document.getElementById('noise').innerText = 'Noise: ' + (j.noise === null ? '—' : j.noise.toFixed(1) + ' dBm');"
+    "  document.getElementById('snr').innerText = 'SNR: ' + (j.snr === null ? '—' : j.snr.toFixed(1) + ' dB');"
+    "  document.getElementById('signal').innerText = 'Signal: ' + (j.signal ? 'есть' : 'нет');"
 
-    if (!g_map) {
-        initMap();
-    }
-    const pos = [lat, lon];
-    if (!g_marker) {
-        g_marker = L.marker(pos).addTo(g_map);
-        g_map.setView(pos, 8);
-    } else {
-        g_marker.setLatLng(pos);
-    }
-}
+    "  document.getElementById('freqest').innerText = 'FREQEST: ' + j.afc_freqest + '  Δf: ' + j.afc_df + ' Hz';"
 
-async function refreshStatus() {
-    try {
-        const r = await fetch("/status");
-        const j = await r.json();
+    "  document.getElementById('frames').innerText = 'Frames: total=' + j.frames_total + ', valid=' + j.frames_valid + ', crc_fail=' + j.frames_crc_fail;"
+    "  document.getElementById('sync_hits').innerText = 'Sync hits: ' + j.sync_hits;"
+    "  document.getElementById('last_shift').innerText = 'Last valid shift: ' + (j.last_shift === null ? '—' : j.last_shift);"
+    "  document.getElementById('last_age').innerText = 'Last frame age: ' + (j.last_frame_age === null ? '—' : j.last_frame_age.toFixed(1) + ' s');"
 
-        // Режим
-        const modeSpan = document.getElementById("mode");
-        const pill = document.getElementById("mode_pill");
-        if (j.mode === "fixed_freq") {
-            modeSpan.innerText = "FIXED";
-            pill.innerText = "FIXED";
-            pill.className = "status-pill status-fixed";
-        } else {
-            modeSpan.innerText = "SCAN";
-            pill.innerText = "SCAN";
-            pill.className = "status-pill status-scan";
-        }
+    "  document.getElementById('lat').innerText = 'lat: ' + (j.lat === null ? '—' : j.lat);"
+    "  document.getElementById('lon').innerText = 'lon: ' + (j.lon === null ? '—' : j.lon);"
+    "  document.getElementById('alt').innerText = 'alt: ' + (j.alt === null ? '—' : j.alt + ' m');"
+    "  document.getElementById('batt').innerText = 'Vbat: ' + (j.batt_v === null ? '—' : j.batt_v.toFixed(2) + ' V');"
+    " }catch(e){}"
+    "}"
+    "setInterval(upd, 1000);"
+    "</script>"
 
-        // Частота
-        document.getElementById("freq_hz").innerText  = fmt(j.freq_hz, 0);
-        document.getElementById("freq_mhz").innerText = fmt(j.freq_mhz, 3);
-
-        // RF
-        document.getElementById("rssi").innerText   = fmt(j.rssi, 1);
-        document.getElementById("rssi_f").innerText = fmt(j.rssi_filt, 1);
-        document.getElementById("noise").innerText  = fmt(j.noise, 1);
-        const sigEl = document.getElementById("signal");
-        sigEl.innerText = j.signal ? "ДА" : "нет";
-        sigEl.className = j.signal ? "good" : "bad";
-
-        // Кадр
-        document.getElementById("last_time").innerText = fmt(j.last_timestamp, 0);
-        document.getElementById("lat").innerText       = fmt(j.lat, 6);
-        document.getElementById("lon").innerText       = fmt(j.lon, 6);
-        document.getElementById("alt").innerText       = fmt(j.alt, 1);
-        document.getElementById("vspeed").innerText    = fmt(j.vspeed, 2);
-        document.getElementById("hspeed").innerText    = fmt(j.hspeed, 2);
-        document.getElementById("temp").innerText      = fmt(j.temp, 2);
-        document.getElementById("hum").innerText       = fmt(j.humidity, 1);
-        document.getElementById("bat").innerText       = fmt(j.battery, 0);
-
-        // Обновить карту
-        if (j.lat !== null && j.lon !== null) {
-            updateMap(j.lat, j.lon);
-        }
-    } catch (e) {
-        // тихо игнорируем сетевые ошибки
-        console.log("status error", e);
-    }
-}
-
-async function setFixed() {
-    const val = document.getElementById("freq_input").value.trim();
-    if (!val) return;
-    await fetch("/set_fixed?freq=" + encodeURIComponent(val));
-    setTimeout(refreshStatus, 500);
-}
-
-async function setScan() {
-    await fetch("/set_scan");
-    setTimeout(refreshStatus, 500);
-}
-
-window.onload = function () {
-    initMap();
-    refreshStatus();
-    setInterval(refreshStatus, 1000);
-};
-</script>
-</head>
-
-<body>
-<div class="header">
-  <h2>M20 Tracker Web UI</h2>
-</div>
-<div class="container">
-
-<div class="card">
-  <h3>Режим и частота</h3>
-  <div>
-    <b>Режим:</b> <span id="mode">—</span>
-    <span id="mode_pill" class="status-pill status-bad">—</span>
-  </div>
-  <div class="mono">
-    <b>Текущая частота:</b>
-    <span id="freq_hz">—</span> Гц
-    (<span id="freq_mhz">—</span> МГц)
-  </div>
-  <br>
-  <div>
-    <label>Ручной ввод (Гц / МГц):</label>
-    <input id="freq_input" type="text" placeholder="405.400 или 405400000">
-    <button onclick="setFixed()">FIXED</button>
-    <button class="secondary" onclick="setScan()">SCAN</button>
-  </div>
-</div>
-
-<div class="card">
-  <h3>RF мониторинг</h3>
-  <div class="row">
-    <div class="col">
-      RSSI raw: <span id="rssi">—</span> dBm<br>
-      RSSI фильтр.: <span id="rssi_f">—</span> dBm<br>
-      Уровень шума: <span id="noise">—</span> dBm<br>
-      Сигнал: <span id="signal" class="mid">—</span><br>
-    </div>
-  </div>
-</div>
-
-<div class="card">
-  <h3>Последний принятый кадр</h3>
-  Время (timestamp): <span id="last_time">—</span><br><br>
-
-  <div class="row">
-    <div class="col">
-      <b>Координаты:</b><br>
-      lat: <span id="lat">—</span><br>
-      lon: <span id="lon">—</span><br>
-      alt: <span id="alt">—</span> м<br><br>
-    </div>
-    <div class="col">
-      <b>Скорости:</b><br>
-      V: <span id="vspeed">—</span> м/с<br>
-      H: <span id="hspeed">—</span> м/с<br><br>
-      <b>Погода:</b><br>
-      T: <span id="temp">—</span> °C<br>
-      RH: <span id="hum">—</span> %<br><br>
-      <b>Батарея:</b> <span id="bat">—</span> мВ<br>
-    </div>
-  </div>
-
-  <!-- Карта с последними координатами -->
-  <div id="map"></div>
-</div>
-
-</div>
-</body>
-</html>
-"""
+    "</body></html>"
+)
 
 
-# ------------------------------------------------------
-# Формирование статуса для /status (JSON)
-# ------------------------------------------------------
-def _status_dict():
-    mode, fixed_freq = track.get_rf_control_mode()
-    last = sonde.as_dict()
-
-    freq_hz = track.rf_frequency_hz
-    if freq_hz is None and fixed_freq:
-        freq_hz = fixed_freq
-
-    if freq_hz:
-        freq_mhz = freq_hz / 1_000_000.0
-    else:
-        freq_mhz = None
-
-    return {
-        "mode": mode,
-        "freq_hz": freq_hz,
-        "freq_mhz": freq_mhz,
-        "rssi": track.rf_rssi_dbm,
-        "rssi_filt": track.rf_rssi_filt,
-        "noise": track.noise_floor,
-        "signal": track.signal_present,
-        "last_timestamp": last["timestamp"],
-        "lat": last["lat"],
-        "lon": last["lon"],
-        "alt": last["alt"],
-        "vspeed": last["vspeed"],
-        "hspeed": last["hspeed"],
-        "temp": last["temp"],
-        "humidity": last["humidity"],
-        "battery": last["battery"],
-    }
-
-
-# ------------------------------------------------------
-# Парсер частоты из строки
-#  - "405.400"    -> 405400000
-#  - "405400"     -> 405400000
-#  - "405400000"  -> 405400000
-# ------------------------------------------------------
-def _parse_freq_hz(s):
-    s = s.strip().replace(",", ".")
-    if not s:
-        return None
-
-    # Есть точка → явно MHz
-    if "." in s:
-        try:
-            mhz = float(s)
-            return int(mhz * 1_000_000)
-        except:
-            return None
-
-    # Только цифры
+def parse_freq(x):
     try:
-        v = int(s)
+        x = x.lower().strip()
+        if x.endswith("mhz") or x.endswith("m"):
+            return int(float(x.rstrip("mhz").rstrip("m")) * 1_000_000)
+        if x.endswith("khz") or x.endswith("k"):
+            return int(float(x.rstrip("khz").rstrip("k")) * 1000)
+        if "." in x:
+            return int(float(x))
+        return int(x)
     except:
         return None
 
-    # Если число маленькое (< 1e6), трактуем как кГц (405400 -> 405.4 MHz)
-    if v < 1_000_000:
-        return v * 1000
-    else:
-        # Уже в Гц
-        return v
 
+def start_server(tracker):
+    print("[WEB] start on :80")
 
-# ------------------------------------------------------
-# Обработка команд управления режимом
-# ------------------------------------------------------
-def _handle_command(first_line):
-    # /set_fixed?freq=...
-    if first_line.startswith("GET /set_fixed"):
-        try:
-            path = first_line.split(" ", 2)[1]  # "/set_fixed?freq=..."
-            if "freq=" in path:
-                part = path.split("freq=", 1)[1]
-                val = ""
-                for ch in part:
-                    if ch in "0123456789.,":  # допускаем точку и запятую
-                        val += ch
-                    else:
-                        break
-                freq = _parse_freq_hz(val)
-                if freq:
-                    track.set_rf_control_mode("fixed_freq", freq)
-        except Exception as e:
-            print("WEB set_fixed error:", e)
-
-    # /set_scan
-    elif first_line.startswith("GET /set_scan"):
-        track.set_rf_control_mode("auto_scan")
-
-
-# ------------------------------------------------------
-# HTTP сервер
-# ------------------------------------------------------
-def start_server():
-    addr = socket.getaddrinfo("0.0.0.0", config.HTTP_PORT)[0][-1]
+    addr = socket.getaddrinfo("0.0.0.0", 80)[0][-1]
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    try:
-        s.bind(addr)
-        s.listen(2)
-        print("HTTP server listening on port", config.HTTP_PORT)
-    except Exception as e:
-        print("Web UI: bind error:", e)
-        return
+    s.bind(addr)
+    s.listen(2)
 
     while True:
+        cl, addr = s.accept()
         try:
-            client, a = s.accept()
-            req = client.recv(1024).decode("utf-8", "ignore")
-            if not req:
-                client.close()
-                continue
+            req = cl.recv(512).decode()
+        except:
+            cl.close()
+            continue
 
-            first_line = req.split("\r\n", 1)[0]
+        if not req:
+            cl.close()
+            continue
 
-            # JSON статус
-            if first_line.startswith("GET /status"):
-                st = _status_dict()
-                body = json.dumps(st)
-                client.send("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
-                client.send(body)
-                client.close()
-                continue
+        first = req.split("\n")[0]
 
-            # Команды управления режимом
-            if first_line.startswith("GET /set_fixed") or first_line.startswith("GET /set_scan"):
-                _handle_command(first_line)
-                client.send("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK")
-                client.close()
-                continue
+        # ---------- STATUS ----------
+        if "GET /status" in first:
+            t = tracker
+            d = {}
 
-            # Основная страница "/"
-            client.send("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n")
-            client.sendall(PAGE)
-            client.close()
+            # базовое состояние
+            d["state"] = t.state
+            d["fixed"] = t.fixed_mode
+            d["freq"] = t.track.freq
 
-        except Exception as e:
-            print("Web UI client error:", e)
+            # радио
+            d["rssi"] = t.track.rssi
+            d["raw_rssi"] = getattr(t.track, "raw_rssi", None)
+            d["noise"] = getattr(t.track, "noise", None)
+            d["snr"] = getattr(t.track, "snr", None)
+            d["signal"] = getattr(t.track, "signal", 0)
+
+            # AFC
+            d["afc_conf"] = t.afc.confirmed_freq
+            d["afc_streak"] = t.afc.streak
+            d["afc_freqest"] = t.afc.last_freqest
+            d["afc_df"] = t.afc.last_df
+
+            # статистика декодера
+            dec = t.decoder
+            d["frames_total"] = dec.frames_total
+            d["frames_valid"] = dec.frames_valid
+            d["frames_crc_fail"] = dec.frames_crc_fail
+            d["sync_hits"] = dec.sync_hits
+            d["last_shift"] = dec.last_valid_shift
+
+            # возраст последнего успешного кадра
+            if t.track.last_frame_time is not None:
+                age_ms = time.ticks_diff(time.ticks_ms(), t.track.last_frame_time)
+                d["last_frame_age"] = age_ms / 1000.0
+            else:
+                d["last_frame_age"] = None
+
+            # телеметрия
+            d["lat"] = t.track.last_lat
+            d["lon"] = t.track.last_lon
+            d["alt"] = t.track.last_alt
+            d["batt_v"] = t.track.last_batt_v
+
+            js = json.dumps(d)
+            cl.send("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")
+            cl.send(js)
+            cl.close()
+            continue
+
+        # ---------- SET FIXED ----------
+        if "GET /set?" in first:
             try:
-                client.close()
+                q = first.split("?", 1)[1]
+                q = q.split(" ", 1)[0]
+                kv = q.split("=")
+                if len(kv) == 2:
+                    f = parse_freq(kv[1])
+                    if f:
+                        print("[WEB] set FIXED freq:", f)
+                        tracker.set_fixed_frequency(f)
             except:
                 pass
-            time.sleep_ms(100)
+            cl.send("HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n")
+            cl.close()
+            continue
+
+        # ---------- CLEAR FIXED ----------
+        if "GET /clear" in first:
+            tracker.clear_fixed_mode()
+            cl.send("HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n")
+            cl.close()
+            continue
+
+        # ---------- MAIN PAGE ----------
+        cl.sendall(PAGE)
+        cl.close()

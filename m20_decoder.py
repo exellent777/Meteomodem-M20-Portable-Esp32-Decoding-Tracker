@@ -1,153 +1,194 @@
-# m20_decoder.py — декодер кадров M20 для M20 Tracker
-#
-# Вход:
-#   decode_m20(buffers)
-#     buffers — список байтовых кадров-кандидатов (bytes), как возвращает
-#               gdo0_bitstream.bits_to_bytes().
-#
-# Задача:
-#   - проверить базовую сигнатуру (0x45 0x20)
-#   - посчитать CRC так же, как в M10/M20-декодере (update_checkM10M20 / crc_M10M20)
-#   - использовать длину кадра из первого байта (frame[0] + 1)
-#   - вернуть первый валидный кадр (bytes) или None.
+# m20_decoder.py — улучшенный robust sync + статистика для M20
+# Работает с M20_SYNC_BYTES = b"\x99\x99\x4C\x99"
 
-import gc
+from config import M20_SYNC_BYTES
+import time
 
-TYPE_M20 = 0x20      # тип кадра для M20
-MIN_LEN  = 40        # минимальная разумная длина (байт)
-MAX_LEN  = 100       # чтобы отсеивать откровенный мусор
+SYNC = M20_SYNC_BYTES
+SYNC_LEN = len(SYNC)
+
+# Допуск по расстоянию Хэмминга для sync (в битах по всему 32-битному слову)
+SYNC_HAMMING_THRESH = 4
+
+MIN_FRAME_LEN = 10
+MAX_FRAME_LEN = 300
 
 
-def update_checkM10M20(c, b):
-    """
-    Порт функции update_checkM10M20 из M10M20.cpp.
+def hamming_bytes(a, b):
+    """Hamming distance между двумя byte-строками одинаковой длины."""
+    d = 0
+    for x, y in zip(a, b):
+        v = x ^ y
+        while v:
+            d += 1
+            v &= v - 1
+    return d
 
-    """
-    c &= 0xFFFF
+
+def update_checkM10(c, b):
+    """Алгоритм CHECKM10 (как в m20mod)."""
     b &= 0xFF
-
-    c1 = c & 0xFF
-
-    # B
-    b = ((b >> 1) | ((b & 0x01) << 7)) & 0xFF
+    b = ((b >> 1) | ((b & 1) << 7)) & 0xFF
     b ^= (b >> 2) & 0xFF
-
-    # A1
-    t6 = ((c >> 0) & 1) ^ ((c >> 2) & 1) ^ ((c >> 4) & 1)
-    t7 = ((c >> 1) & 1) ^ ((c >> 3) & 1) ^ ((c >> 5) & 1)
-    t = (c & 0x3F) | (t6 << 6) | (t7 << 7)
-
-    # A2
-    s = (c >> 7) & 0xFF
-    s ^= (s >> 2) & 0xFF
-
-    c0 = (b ^ t ^ s) & 0xFF
-
-    return ((c1 << 8) | c0) & 0xFFFF
+    c ^= b
+    for _ in range(8):
+        fb = c & 1
+        c >>= 1
+        if fb:
+            c ^= 0x98
+    return c & 0xFF
 
 
-def crc_M10M20(buf, length):
-    """
-    crc_M10M20(int len, uint8_t *msg)
-
-    uint16_t cs = 0;
-    for (int i = 0; i < len; i++) {
-        cs = update_checkM10M20(cs, msg[i]);
-    }
-    return cs;
-    """
+def checkM10(frame):
+    """Полный CHECKM10 для кадра."""
+    if len(frame) < 2:
+        return False
     cs = 0
-    if length <= 0:
-        return 0
-
-    if length > len(buf):
-        length = len(buf)
-
-    for i in range(length):
-        cs = update_checkM10M20(cs, buf[i])
-
-    return cs & 0xFFFF
+    for b in frame[:-1]:
+        cs = update_checkM10(cs, b)
+    return cs == frame[-1]
 
 
-def checkM10M20crc(crcpos, frame):
-    """
-    checkM10M20crc(int crcpos, uint8_t *msg):
+class M20Decoder:
+    def __init__(self, callback, debug=False):
+        # callback вызывается ТОЛЬКО для валидных кадров (CRC OK)
+        self.cb = callback
+        self.debug = debug
 
-        uint16_t cs, cs1;
-        cs = crc_M10M20(crcpos, msg);
-        cs1 = (msg[crcpos] << 8) | msg[crcpos+1];
-        return (cs1 == cs);
-    """
-    # crcpos — позиция старшего байта CRC
-    if crcpos < 0:
-        return False
-    if crcpos + 1 >= len(frame):
-        return False
+        # sliding window для поиска sync
+        self.win = bytearray(SYNC_LEN)
+        self.wpos = 0
 
-    cs = crc_M10M20(frame, crcpos)
-    cs1 = ((frame[crcpos] << 8) | frame[crcpos + 1]) & 0xFFFF
-    return cs1 == cs
+        # состояние захвата кадра
+        self.capturing = False
+        self.buf = bytearray()
+        self.expected = None
 
+        # статистика
+        self.sync_hits = 0
+        self.frames_total = 0
+        self.frames_valid = 0
+        self.frames_crc_fail = 0
+        self.last_valid_shift = None
+        self.last_frame_ok = False
+        self.last_sync_time = None
 
-def _frame_looks_like_m20(frame):
-    """
-    Быстрая фильтрация мусора до CRC.
+    # ============================================================
+    # Основной вход: по одному байту из GDO0-декодера
+    # ============================================================
+    def feed_byte(self, b):
+        b &= 0xFF
 
-    M20:
-      frame[0] ≈ длина (0x45 для основной посылки)
-      frame[1] = 0x20 (тип кадра)
-    """
-    if not frame or len(frame) < 4:
-        return False
+        # обновляем окно sync
+        self.win[self.wpos] = b
+        self.wpos = (self.wpos + 1) % SYNC_LEN
 
-    # Тип кадра
-    if frame[1] != TYPE_M20:
-        return False
+        # если НЕ в захвате → ищем sync
+        if not self.capturing:
+            if self._sync_match(bytes(self.win)):
+                if self.debug:
+                    print("[M20] SYNC detected")
+                self._on_sync_hit()
+                self.capturing = True
+                self.buf = bytearray()
+                self.expected = None
+            return
 
-    fl = frame[0]
-    # Не даём длине выходить за пределы разумного
-    if fl < MIN_LEN or fl > MAX_LEN:
-        return False
+        # ---- мы в режиме захвата кадра ----
+        self.buf.append(b)
 
-    return True
+        # первый байт после sync — длина
+        if self.expected is None:
+            if len(self.buf) >= 1:
+                L = self.buf[0]
+                total = L + 1
+                if not (MIN_FRAME_LEN <= total <= MAX_FRAME_LEN):
+                    if self.debug:
+                        print("[M20] bad length L=", L)
+                    self._reset_state()
+                    return
+                self.expected = total
+            return
 
+        # если набрали нужную длину кадра
+        if len(self.buf) >= self.expected:
+            frame = bytes(self.buf)
+            self._handle_frame(frame)
+            self._reset_state()
 
-def decode_m20(buffers):
-    """
-    Перебирает все кадры-кандидаты и ищет первый с корректной M10/M20-CRC.
+    # ============================================================
+    # Поиск sync: 8 фазовых сдвигов + расстояние Хэмминга
+    # ============================================================
+    def _sync_match(self, window):
+        if len(window) != SYNC_LEN:
+            return False
 
-    Логика максимально близка к decodeframeM20 в M10M20.cpp:
-      - фактическая длина берётся как (frame[0] + 1),
-      - CRC считается по байтам 0 .. (frl-3),
-      - сравнение идёт с frame[frl-2], frame[frl-1].
+        best = 999
+        for shift in range(8):
+            shifted = self._shift_frame_bits(window, shift)
+            d = hamming_bytes(shifted, SYNC)
+            if d < best:
+                best = d
 
-    Возвращает bytes(кадр) или None.
-    """
-    gc.collect()
+        # Чем меньше порог, тем жёстче — 4 бита на 32-битный sync это довольно строго
+        return best <= SYNC_HAMMING_THRESH
 
-    if not buffers:
-        return None
+    def _on_sync_hit(self):
+        self.sync_hits += 1
+        self.last_sync_time = time.ticks_ms()
 
-    for frame in buffers:
-        if not frame:
-            continue
+    # ============================================================
+    # Обработка полного кадра
+    # ============================================================
+    def _handle_frame(self, frame):
+        if self.debug:
+            print("[M20] frame raw:", frame.hex())
 
-        f = bytes(frame)
+        self.frames_total += 1
+        ok = False
+        last_shift = None
 
-        if not _frame_looks_like_m20(f):
-            continue
+        # пробуем 8 фазовых сдвигов
+        for shift in range(8):
+            shifted = self._shift_frame_bits(frame, shift)
+            if checkM10(shifted):
+                ok = True
+                last_shift = shift
+                if self.debug:
+                    print("[M20] VALID frame (shift=", shift, ")")
+                # вызываем callback для валидного кадра
+                self.cb(shifted)
+                break
 
-        # Фактическая длина кадра (как в TTGO: frl = data[0] + 1)
-        frl = f[0] + 1
-        if frl > len(f):
-            frl = len(f)
+        if ok:
+            self.frames_valid += 1
+            self.last_valid_shift = last_shift
+            self.last_frame_ok = True
+        else:
+            if self.debug:
+                print("[M20] INVALID frame (CRC mismatch)")
+            self.frames_crc_fail += 1
+            self.last_frame_ok = False
 
-        crcpos = frl - 2
-        if crcpos <= 0:
-            continue
+    # ============================================================
+    # Битовый сдвиг
+    # ============================================================
+    @staticmethod
+    def _shift_frame_bits(frame, shift):
+        if shift == 0:
+            return frame
+        out = bytearray(len(frame))
+        carry = 0
+        for i, b in enumerate(frame):
+            new = ((b >> shift) | (carry << (8 - shift))) & 0xFF
+            carry = b & ((1 << shift) - 1)
+            out[i] = new
+        return bytes(out)
 
-        if checkM10M20crc(crcpos, f):
-            # Возвращаем кадр, обрезанный до фактической длины
-            return f[:frl]
-
-    return None
+    # ============================================================
+    # Сброс состояния захвата
+    # ============================================================
+    def _reset_state(self):
+        self.capturing = False
+        self.buf = bytearray()
+        self.expected = None

@@ -1,91 +1,82 @@
-# track_store.py — хранение состояния системы + фильтры RSSI
+# track_store.py — хранение состояния трека и параметров сигнала
 
 import time
 
+# Порог, на сколько dB сигнал должен быть выше шума, чтобы считать "есть сигнал"
+RSSI_SIGNAL_DELTA_DB = 6.0
+
+
 class TrackStore:
     def __init__(self):
-        # -------- RF monitoring --------
-        self.rf_frequency_hz = None       # текущая частота
-        self.rf_rssi_dbm = None           # последний RSSI
-        self.rf_rssi_filt = None          # сглаженный RSSI
-        self.noise_floor = None           # уровень шума
-        self.signal_threshold = 6         # сколько dB над шумом считаем сигналом
-        self.signal_present = False       # флаг "есть сигнал"
+        # частота, на которой сейчас "сидит" приёмник
+        self.freq = 0
 
-        # -------- RF control --------
-        self.rf_mode = "auto_scan"        # режим: auto_scan / fixed_freq
-        self.rf_fixed_freq_hz = None
+        # параметры сигнала
+        self.rssi = None       # сглаженный RSSI
+        self.raw_rssi = None   # сырое мгновенное значение RSSI
+        self.noise = None      # оценка шума (фоновый уровень)
+        self.snr = None        # SNR = rssi - noise
+        self.signal = 0        # 1 = есть сигнал над шумом, 0 = нет
 
-        # -------- Track info --------
-        self.last_frame = None
+        # время последнего валидного кадра (ms ticks)
         self.last_frame_time = None
 
-        # -------- Internal flags --------
-        self._need_restart = False
+        # последняя телеметрия M20
+        self.last_lat = None
+        self.last_lon = None
+        self.last_alt = None
+        self.last_velE = None
+        self.last_velN = None
+        self.last_velU = None
+        self.last_serial = None
+        self.last_batt_v = None
 
-    # ------------------------------------------------------
-    #  RSSI filtering + detection of real signal
-    # ------------------------------------------------------
-    def update_rssi(self, rssi_dbm: float):
-        """Обновляет RAW RSSI, сглаженный RSSI, шум и флаг сигнала."""
+    def update_rssi(self, radio):
+        """Обновить RSSI/шум/SNR/флаг signal по данным CC1101."""
+        raw = radio.read_rssi_dbm()
+        self.raw_rssi = raw
 
-        self.rf_rssi_dbm = rssi_dbm
-
-        if rssi_dbm is None:
+        if raw is None:
             return
 
-        # 1) Сглаживание RSSI (экспоненциальное)
-        if self.rf_rssi_filt is None:
-            self.rf_rssi_filt = rssi_dbm
+        # экспоненциальное сглаживание RSSI
+        if self.rssi is None:
+            self.rssi = raw
         else:
-            self.rf_rssi_filt = 0.3 * rssi_dbm + 0.7 * self.rf_rssi_filt
+            self.rssi = 0.3 * raw + 0.7 * self.rssi
 
-        # 2) Обновление шумового уровня:
-        #    если давно нет кадра — значит это шум.
-        if self.last_frame_time is None or (time.time() - self.last_frame_time) > 5:
-            if self.noise_floor is None:
-                self.noise_floor = self.rf_rssi_filt
+        # если давно не было валидных кадров — считаем текущий уровень шумом
+        now = time.ticks_ms()
+        if (self.last_frame_time is None) or \
+           (time.ticks_diff(now, self.last_frame_time) > 5000):
+            if self.noise is None:
+                self.noise = self.rssi
             else:
-                self.noise_floor = 0.2 * self.rf_rssi_filt + 0.8 * self.noise_floor
+                self.noise = 0.2 * self.rssi + 0.8 * self.noise
 
-        # 3) Детектор сигнала
-        if self.noise_floor is not None:
-            self.signal_present = (self.rf_rssi_filt > self.noise_floor + self.signal_threshold)
+        # считаем SNR и бинарный флаг наличия сигнала
+        if self.noise is not None:
+            self.snr = self.rssi - self.noise
+            self.signal = 1 if self.snr > RSSI_SIGNAL_DELTA_DB else 0
         else:
-            self.signal_present = False
+            self.snr = None
+            self.signal = 0
 
-    # ------------------------------------------------------
-    #  Frames
-    # ------------------------------------------------------
-    def set_last_frame(self, frame):
-        self.last_frame = frame
-        self.last_frame_time = time.time()
+    def update_from_frame(self, frame):
+        """Обновить телеметрию и отметку времени по валидному M20-кадру."""
+        self.last_lat = frame.lat
+        self.last_lon = frame.lon
+        self.last_alt = frame.alt
 
-    def get_last_frame(self):
-        return self.last_frame
+        self.last_velE = frame.velE
+        self.last_velN = frame.velN
+        self.last_velU = frame.velU
 
-    # ------------------------------------------------------
-    #  RF modes
-    # ------------------------------------------------------
-    def set_rf_control_mode(self, mode, freq=None):
-        self.rf_mode = mode
-        self.rf_fixed_freq_hz = freq
+        self.last_serial = frame.serial
+        self.last_batt_v = frame.batt_v
 
-    def get_rf_control_mode(self):
-        return self.rf_mode, self.rf_fixed_freq_hz
+        self.last_frame_time = time.ticks_ms()
 
-    # ------------------------------------------------------
-    #  Restart requests (FSM interaction)
-    # ------------------------------------------------------
-    def request_restart(self):
-        self._need_restart = True
-
-    def consume_restart_request(self):
-        if self._need_restart:
-            self._need_restart = False
-            return True
-        return False
-
-
-# Глобальный экземпляр (используется во всех модулях)
-track = TrackStore()
+    def lost(self):
+        """Вызывается, когда трекер считает зонд потерянным."""
+        self.signal = 0

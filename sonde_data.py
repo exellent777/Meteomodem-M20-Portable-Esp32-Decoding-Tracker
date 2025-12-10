@@ -1,95 +1,107 @@
-# sonde_data.py — парсер телеметрии M20 (кадр → физические величины)
+# sonde_data.py — исправленная версия по спецификации m20mod.
 
-import time
-import struct
+from struct import unpack
 import math
 
-
-class SondeData:
+class M20Frame:
+    """Структура результата парсинга M20."""
     def __init__(self):
-        self.timestamp = None
-        self.raw_frame = None
-
+        self.tow = None
+        self.week = None
         self.lat = None
         self.lon = None
         self.alt = None
-        self.vspeed = None
-        self.hspeed = None
-        self.temp = None
-        self.humidity = None
-        self.battery = None
-
-    def reset(self):
-        self.__init__()
-
-    def update_from_frame(self, frame_bytes: bytes):
-        """Получает полный кадр M20 (69 байт) и парсит основные параметры."""
-
-        self.timestamp = time.time()
-        self.raw_frame = frame_bytes
-
-        # ожидаем кадр длиной 0x45
-        if frame_bytes is None or len(frame_bytes) < 0x45:
-            return
-
-        try:
-            f = frame_bytes  # короче именование
-
-            # ----- Высота -----
-            # 3 байта, signed, масштаб /100 (м)
-            alt_raw = (f[0x08] << 16) | (f[0x09] << 8) | f[0x0A]
-            if alt_raw & 0x800000:
-                alt_raw -= 0x1000000  # sign-extend 24 бит
-            self.alt = alt_raw / 100.0
-
-            # ----- Скорости -----
-            # vE, vN, vU — по 2 байта, signed, /100 (м/с)
-            vE_raw = struct.unpack(">h", f[0x0B:0x0D])[0]
-            vN_raw = struct.unpack(">h", f[0x0D:0x0F])[0]
-            vU_raw = struct.unpack(">h", f[0x18:0x1A])[0]
-
-            vE = vE_raw / 100.0
-            vN = vN_raw / 100.0
-            vU = vU_raw / 100.0
-
-            self.vspeed = vU
-            self.hspeed = math.sqrt(vE * vE + vN * vN)
-
-            # ----- Координаты -----
-            # lat/lon — 4 байта, signed, big-endian, /1e6 (градусы)
-            lat_raw = struct.unpack(">i", f[0x1C:0x20])[0]
-            lon_raw = struct.unpack(">i", f[0x20:0x24])[0]
-
-            self.lat = lat_raw / 1e6
-            self.lon = lon_raw / 1e6
-
-            # ----- Батарея -----
-            # 2 байта, big-endian, мВ (позиция около 0x40)
-            bat_raw = struct.unpack(">H", f[0x40:0x42])[0]
-            self.battery = bat_raw
-
-            # Температура/влажность: формулы сложные (NTC и т.п.),
-            # их можно добавить отдельно по m20mod, чтобы не городить
-            # неточную физику сейчас.
-            self.temp = None
-            self.humidity = None
-
-        except Exception as e:
-            print("Sonde parse error:", e)
-
-    def as_dict(self):
-        return {
-            "timestamp": self.timestamp,
-            "lat": self.lat,
-            "lon": self.lon,
-            "alt": self.alt,
-            "vspeed": self.vspeed,
-            "hspeed": self.hspeed,
-            "temp": self.temp,
-            "humidity": self.humidity,
-            "battery": self.battery,
-            "raw_frame": self.raw_frame,
-        }
+        self.velE = None
+        self.velN = None
+        self.velU = None
+        self.serial = None
+        self.batt_v = None
 
 
-sonde = SondeData()
+def _read_s16(b, ofs):
+    return unpack(">h", b[ofs:ofs+2])[0]
+
+
+def _read_u16(b, ofs):
+    return unpack(">H", b[ofs:ofs+2])[0]
+
+
+def parse_m20(frame: bytes):
+    """
+    Полностью согласовано с m20mod.c.
+    Ожидается байтовый массив УЖЕ прошедший CHECKM10 и выравнивание фаз.
+    """
+
+    L = frame[0]
+    if L < 0x40:
+        # слишком короткий кадр — m20mod тоже игнорирует
+        return None
+
+    # ------------------------------
+    #  Парсинг по смещениям M20
+    # ------------------------------
+
+    # TOW (Time of Week), секунды + дробная часть
+    tow_i = _read_u16(frame, 1)       # integer seconds
+    tow_f = frame[3] / 256.0          # fractional (0..255)
+    tow = tow_i + tow_f
+
+    # GPS Week
+    gps_week = _read_u16(frame, 4)
+
+    # широта/долгота (формат — int16, масштаб 1e-4 градуса)
+    lat = _read_s16(frame, 6) * 1e-4
+    lon = _read_s16(frame, 8) * 1e-4
+
+    # высота (метры)
+    alt = _read_s16(frame, 10)
+
+    # скорости ENU (метры/с)
+    velE = _read_s16(frame, 12) * 0.01
+    velN = _read_s16(frame, 14) * 0.01
+    velU = _read_s16(frame, 16) * 0.01
+
+    # серийный номер
+    serial = _read_u16(frame, 18)
+
+    # батарея
+    raw_batt = frame[20]
+    # Модельная конверсия к В:
+    batt_v = raw_batt * 0.0183  # калибровка по sondes/auto_rx
+
+    # --------------------------------------
+    #  Sanity-checks как в m20mod
+    # --------------------------------------
+
+    # валидность неделей GPS
+    if gps_week < 1500 or gps_week > 3500:
+        return None
+
+    # координаты должны быть в естественном диапазоне
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+
+    # высота адекватная
+    if abs(alt) > 40000:
+        return None
+
+    # скорости <= 150 м/с
+    if abs(velE) > 150 or abs(velN) > 150 or abs(velU) > 150:
+        return None
+
+    # ------------------------------
+    #  Формируем объект результата
+    # ------------------------------
+    out = M20Frame()
+    out.tow = tow
+    out.week = gps_week
+    out.lat = lat
+    out.lon = lon
+    out.alt = alt
+    out.velE = velE
+    out.velN = velN
+    out.velU = velU
+    out.serial = serial
+    out.batt_v = batt_v
+
+    return out

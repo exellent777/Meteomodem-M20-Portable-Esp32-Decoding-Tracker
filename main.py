@@ -1,216 +1,155 @@
-# main.py — главный цикл трекера (FSM: SCAN → VALIDATE → TRACK)
+# main.py — SCAN/TRACK логика + FIXED режим "сидим на частоте и слушаем"
 
 import time
-import config
-from track_store import track
-from cc1101 import Radio
-from gdo0_bitstream import collect_bits_from_gdo0, bits_to_bytes
-from m20_decoder import decode_m20
-from sonde_data import sonde
-from afc import afc
+
+from cc1101 import CC1101Radio
+from gdo0_bitstream import BitstreamCollector
+from m20_decoder import M20Decoder
+from sonde_data import parse_m20
+from track_store import TrackStore
+from afc import AFC
+from config import (
+    SCAN_START_HZ,
+    SCAN_END_HZ,
+    SCAN_STEP_HZ,
+    SCAN_DWELL_MS,
+    M20_BITRATE,
+)
 
 
-BITRATE_M20 = 9600
-BITS_PER_FRAME = 800
+class Tracker:
+    def __init__(self):
+        # режимы работы логики
+        # "SCAN" — автоскан по диапазону
+        # "TRACK" — сидим на найденной частоте и ждём кадры
+        self.state = "SCAN"
 
-SCAN_START = 404000000
-SCAN_END   = 406000000
-SCAN_STEP  = 10000
+        # Радио и состояние
+        self.radio = CC1101Radio()
+        self.track = TrackStore()
 
-# Сколько подряд валидных кадров (CRC ok) нужно,
-# чтобы считать частоту действительно M20.
-CONFIRM_FRAMES_REQUIRED = 3
+        # Декодер M20
+        self.decoder = M20Decoder(self._on_m20_frame, debug=False)
 
-# Максимум попыток на частоте в фазе VALIDATE
-MAX_VALIDATE_ATTEMPTS = 8
+        # Сборщик бит с GDO0 (oversampling ×4)
+        self.bitcol = BitstreamCollector(self.decoder.feed_byte, debug=False)
 
-# -------------------------------------------------------
-#  FSM состояния
-# -------------------------------------------------------
-STATE_SCAN = 1
-STATE_VALIDATE = 2
-STATE_TRACK = 3
+        # AFC
+        self.afc = AFC(
+            radio=self.radio,
+            track=self.track,
+            step_hz=400,
+            min_streak=3,
+            loss_timeout=6.0,
+            use_freqest=True,
+            debug=False,
+        )
 
+        # текущее положение сканера
+        self.scan_freq = SCAN_START_HZ
 
-def run_tracker():
-    radio = Radio()
-    radio.configure_m20()
+        # FIXED режим:
+        # True  — сидим на заданной частоте ВСЕГДА
+        # False — обычная логика SCAN/TRACK
+        self.fixed_mode = False
 
-    print("[M20] Трекер запущен.")
+    # ------------------------------------------------------
+    # Вызывается при ВАЛИДНОМ кадре (CHECKM10 + parse OK)
+    # ------------------------------------------------------
+    def _on_m20_frame(self, frame_bytes):
+        frame = parse_m20(frame_bytes)
+        if frame is None:
+            return
 
-    state = STATE_SCAN
-    scan_freq = SCAN_START
+        # обновляем трек
+        self.track.update_from_frame(frame)
 
-    last_frame_ok = False
+        # сообщаем AFC
+        self.afc.on_valid_frame(frame)
 
-    # Счётчики для строгой валидации частоты
-    validate_good = 0
-    validate_total = 0
+        # при сканировании — переходим в TRACK
+        if self.state == "SCAN" and not self.fixed_mode:
+            self.state = "TRACK"
 
-    while True:
+    # ------------------------------------------------------
+    # Режим SCAN — ходим по диапазону
+    # ------------------------------------------------------
+    def _run_scan(self):
+        self.radio.set_frequency(self.scan_freq)
+        self.track.freq = self.scan_freq
 
-        # ---------------------------
-        # FIXED MODE из Web UI
-        # ---------------------------
-        mode, ff = track.get_rf_control_mode()
-        if mode == "fixed_freq" and ff:
-            radio.set_frequency(ff)
-            track.rf_frequency_hz = ff
-            freq = ff
+        # даём радиочипу устаканиться
+        time.sleep_ms(30)
 
-            bits = collect_bits_from_gdo0(
-                BITS_PER_FRAME,
-                BITRATE_M20,
-                source="FIXED",
-                freq_hz=freq,
-                rssi_dbm=None,
-                use_oversample=True,
-            )
+        # обновляем RSSI/шум
+        self.track.update_rssi(self.radio)
 
-            rssi = radio.read_rssi()
-            track.update_rssi(rssi)
+        # следующий шаг по частоте
+        self.scan_freq += SCAN_STEP_HZ
+        if self.scan_freq > SCAN_END_HZ:
+            self.scan_freq = SCAN_START_HZ
 
-            buffers = bits_to_bytes(bits)
-            frame = decode_m20(buffers)
+        time.sleep_ms(SCAN_DWELL_MS)
 
-            if frame:
-                track.set_last_frame(frame)
-                sonde.update_from_frame(frame)
-                last_frame_ok = True
+    # ------------------------------------------------------
+    # Режим TRACK — сидим на частоте и ждём кадры
+    # ------------------------------------------------------
+    def _run_track(self):
+        # всегда обновляем RSSI/шум
+        self.track.update_rssi(self.radio)
+
+        # Если мы в FIXED-режиме — НИКОГДА не выходим в SCAN.
+        # Просто постоянно слушаем поток на этой частоте, даже без сигналов.
+        if self.fixed_mode:
+            time.sleep_ms(50)
+            return
+
+        # Нормальный TRACK-режим с AFC и возвратом в SCAN по потере кадров
+        if self.afc.check_loss():
+            # потеряли — возвращаемся в SCAN
+            self.state = "SCAN"
+            self.track.lost()
+            return
+
+        time.sleep_ms(50)
+
+    # ------------------------------------------------------
+    # Фиксированная частота (задаётся извне, например WebUI)
+    # ------------------------------------------------------
+    def set_fixed_frequency(self, freq_hz):
+        """Включаем FIXED-режим: сидим на freq_hz и постоянно декодируем поток."""
+        self.fixed_mode = True
+        self.state = "TRACK"        # логически: слушаем, а не сканируем
+        self.scan_freq = freq_hz
+
+        self.radio.set_frequency(freq_hz)
+        self.track.freq = freq_hz
+
+        # Сброс AFC, чтобы он не тащил нас куда-то ещё
+        self.afc.reset()
+
+    def clear_fixed_mode(self):
+        """Выходим из FIXED, возвращаем обычную SCAN/TRACK-логику."""
+        self.fixed_mode = False
+        self.state = "SCAN"
+        self.afc.reset()
+
+    # ------------------------------------------------------
+    # Главный цикл
+    # ------------------------------------------------------
+    def run(self):
+        print("Tracker starting…")
+
+        # настраиваем CC1101 под M20 и уходим в RX
+        self.radio.configure_m20()
+        self.radio.enter_rx()
+
+        # запускаем сборщик потока GDO0
+        self.bitcol.start(M20_BITRATE)
+
+        # основной цикл
+        while True:
+            if self.state == "SCAN" and not self.fixed_mode:
+                self._run_scan()
             else:
-                last_frame_ok = False
-
-            continue  # fixed mode не использует FSM
-
-        # ---------------------------
-        # AUTO SCAN / VALIDATE / TRACK
-        # ---------------------------
-
-        if state == STATE_SCAN:
-            # Перебираем частоты
-            radio.set_frequency(scan_freq)
-            track.rf_frequency_hz = scan_freq
-
-            bits = collect_bits_from_gdo0(
-                BITS_PER_FRAME,
-                BITRATE_M20,
-                source="SCAN",
-                freq_hz=scan_freq,
-                rssi_dbm=None,
-                use_oversample=True,
-            )
-
-            rssi = radio.read_rssi()
-            track.update_rssi(rssi)
-
-            # Проверка кандидата
-            buffers = bits_to_bytes(bits)
-            frame = decode_m20(buffers)
-
-            if frame:
-                print(f"[SCAN] Найден кандидат @ {scan_freq/1e6:.3f} МГц → VALIDATE")
-                track.set_last_frame(frame)
-
-                # Первая успешная CRC на этой частоте
-                validate_good = 1
-                validate_total = 1
-
-                state = STATE_VALIDATE
-                continue
-
-            # Следующая частота
-            scan_freq += SCAN_STEP
-            if scan_freq > SCAN_END:
-                scan_freq = SCAN_START
-
-            continue
-
-        # VALIDATE: пытаемся строго подтвердить наличие M20
-        if state == STATE_VALIDATE:
-            freq = track.rf_frequency_hz
-
-            bits = collect_bits_from_gdo0(
-                BITS_PER_FRAME,
-                BITRATE_M20,
-                source="VALIDATE",
-                freq_hz=freq,
-                rssi_dbm=None,
-                use_oversample=True,
-            )
-
-            rssi = radio.read_rssi()
-            track.update_rssi(rssi)
-
-            buffers = bits_to_bytes(bits)
-            frame = decode_m20(buffers)
-
-            if frame:
-                validate_good += 1
-                validate_total += 1
-                track.set_last_frame(frame)
-
-                print(f"[VALIDATE] CRC ok ({validate_good}/{CONFIRM_FRAMES_REQUIRED})")
-
-                if validate_good >= CONFIRM_FRAMES_REQUIRED:
-                    print("[VALIDATE] Частота подтверждена → TRACK")
-                    sonde.update_from_frame(frame)
-                    last_frame_ok = True
-                    state = STATE_TRACK
-                    # Обнулим счётчики на будущее
-                    validate_good = 0
-                    validate_total = 0
-                # иначе остаёмся в VALIDATE и продолжаем слушать эту же частоту
-
-            else:
-                validate_total += 1
-                validate_good = 0  # последовательность прервалась
-                print(f"[VALIDATE] Нет кадра (попытка {validate_total})")
-
-                # Если слишком долго нет кадров или пропал сигнал — возвращаемся в SCAN
-                if validate_total >= MAX_VALIDATE_ATTEMPTS or not track.signal_present:
-                    print("[VALIDATE] Не удалось подтвердить → SCAN")
-                    state = STATE_SCAN
-                    validate_good = 0
-                    validate_total = 0
-
-            continue
-
-        # TRACK: постоянное отслеживание
-        if state == STATE_TRACK:
-            freq = track.rf_frequency_hz
-
-            bits = collect_bits_from_gdo0(
-                BITS_PER_FRAME,
-                BITRATE_M20,
-                source="TRACK",
-                freq_hz=freq,
-                rssi_dbm=None,
-                use_oversample=True,
-            )
-
-            rssi = radio.read_rssi()
-            track.update_rssi(rssi)
-
-            buffers = bits_to_bytes(bits)
-            frame = decode_m20(buffers)
-
-            if frame:
-                track.set_last_frame(frame)
-                sonde.update_from_frame(frame)
-                last_frame_ok = True
-
-                # мягкая AFC-подстройка
-                new_freq = afc.correct_frequency(
-                    radio, freq, rssi, frame_ok=True
-                )
-                track.rf_frequency_hz = new_freq
-
-            else:
-                last_frame_ok = False
-
-                # Нет сигнала → возвращаемся к SCAN
-                if not track.signal_present:
-                    print("[TRACK] Сигнал потерян → SCAN")
-                    state = STATE_SCAN
-
-            continue
+                self._run_track()

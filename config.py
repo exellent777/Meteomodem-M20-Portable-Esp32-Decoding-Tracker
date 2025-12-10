@@ -1,21 +1,30 @@
-# config.py — базовые настройки проекта M20 Tracker
+# config.py — базовые настройки проекта M20 Tracker (m20mod-style)
 
 # ---- CC1101 SPI pins (ESP32-C3) ----
-CC1101_SCK  = 6   # GPIO6  -> SCK
-CC1101_MOSI = 7   # GPIO7  -> MOSI
-CC1101_MISO = 5   # GPIO5  -> MISO
-CC1101_CS   = 4   # GPIO4  -> CSN
-CC1101_GDO0 = 3   # GPIO3  -> GDO0 (data output)
+CC1101_SCK  = 6
+CC1101_MOSI = 7
+CC1101_MISO = 5
+CC1101_CS   = 4
+CC1101_GDO0 = 3
 
 # ---- Web server ----
 HTTP_PORT = 80
 
-# ---- Радионастройки ----
-RF_FREQUENCY_HZ = 405400000   # дефолт при fixed mode
+# ---- Радионастройки для M20 ----
+M20_BITRATE        = 9600          # бод
+M20_BW_KHZ         = 100           # полоса RX
+M20_DEVIATION_KHZ  = 40            # девиация FSK
 
-# ---- Oversampling ----
-OVERSAMPLE = 6                # оптимальное значение
-PREAMBLE_BITS_FOR_PLL = 80    # сколько бит анализировать для мини-PLL
+# Sync для RAW-битового потока
+M20_SYNC_BYTES = b"\x99\x99\x4C\x99"
 
-# ---- Логирование ----
-ENABLE_RAW_LOG = False        # сырые логи отключены (экономия памяти)
+# ---- Параметры сканирования ----
+SCAN_START_HZ = 404000000
+SCAN_END_HZ   = 406000000
+SCAN_STEP_HZ  = 50000
+
+SCAN_DWELL_MS    = 120          # задержка на частоте при SCAN
+TRACK_TIMEOUT_MS = 4000        # потеря сигнала = возврат в SCAN
+
+# ---- Детектор сигнала ----
+RSSI_THRESHOLD = -110

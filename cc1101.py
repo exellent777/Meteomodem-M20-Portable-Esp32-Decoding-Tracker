@@ -1,180 +1,254 @@
-# cc1101.py — драйвер CC1101 для проекта M20 Tracker
-# RAW битовый поток на GDO0, поддержка частоты и RSSI.
+# cc1101.py — CC1101 в RAW 2-FSK режиме для M20
 
-import time
 from machine import Pin, SPI
-import config
+import time
+from config import (
+    CC1101_SCK, CC1101_MOSI, CC1101_MISO, CC1101_CS, CC1101_GDO0,
+    M20_BITRATE, M20_BW_KHZ, M20_DEVIATION_KHZ
+)
 
-# CC1101 Registers
-REG_IOCFG0   = 0x02
-REG_PKTCTRL1 = 0x08
-REG_PKTCTRL0 = 0x07
-REG_FREQ2    = 0x0D
-REG_FREQ1    = 0x0E
-REG_FREQ0    = 0x0F
-REG_MDMCFG4  = 0x10
-REG_MDMCFG3  = 0x11
-REG_MDMCFG2  = 0x12
-REG_MDMCFG1  = 0x13
-REG_MDMCFG0  = 0x14
-REG_DEVIATN  = 0x15
-REG_FOCCTRL  = 0x19
-REG_BSCFG    = 0x1A
-REG_AGCCTRL2 = 0x1B
-REG_AGCCTRL1 = 0x1C
-REG_AGCCTRL0 = 0x1D
-REG_RSSI     = 0x34
+# Регистры CC1101 (по даташиту)
+IOCFG2   = 0x00
+IOCFG1   = 0x01
+IOCFG0   = 0x02
+FIFOTHR  = 0x03
+PKTCTRL1 = 0x07
+PKTCTRL0 = 0x08
+FSCTRL1  = 0x0B
+FSCTRL0  = 0x0C
+FREQ2    = 0x0D
+FREQ1    = 0x0E
+FREQ0    = 0x0F
+MDMCFG4  = 0x10
+MDMCFG3  = 0x11
+MDMCFG2  = 0x12
+MDMCFG1  = 0x13
+MDMCFG0  = 0x14
+DEVIATN  = 0x15
+MCSM2    = 0x16
+MCSM1    = 0x17
+MCSM0    = 0x18
+FOCCFG   = 0x19
+BSCFG    = 0x1A
+AGCCTRL2 = 0x1B
+AGCCTRL1 = 0x1C
+AGCCTRL0 = 0x1D
+WORCTRL  = 0x20
+FREND1   = 0x21
+FREND0   = 0x22
+FSCAL3   = 0x23
+FSCAL2   = 0x24
+FSCAL1   = 0x25
+FSCAL0   = 0x26
+TEST2    = 0x2C
+TEST1    = 0x2D
+TEST0    = 0x2E
+RSSI     = 0x34
+MARCSTATE= 0x35
+FREQEST  = 0x32
 
-# Commands
-CMD_SRES  = 0x30
-CMD_SCAL  = 0x33
-CMD_SRX   = 0x34
-CMD_SIDLE = 0x36
-CMD_SFRX  = 0x3A
-CMD_SFTX  = 0x3B
+# Строб-команды
+SRES   = 0x30
+SFSTXON= 0x31
+SXOFF  = 0x32
+SCAL   = 0x33
+SRX    = 0x34
+STX    = 0x35
+SIDLE  = 0x36
+SFRX   = 0x3A
+SFTX   = 0x3B
+
+READ_SINGLE  = 0x80
+READ_BURST   = 0xC0
+WRITE_BURST  = 0x40
+
+F_XOSC = 26_000_000.0
 
 
-class Radio:
+class CC1101Radio:
     def __init__(self):
-        # SPI init
         self.spi = SPI(
             1,
-            baudrate=2_000_000,
+            baudrate=4_000_000,
             polarity=0,
             phase=0,
-            sck=Pin(config.CC1101_SCK),
-            mosi=Pin(config.CC1101_MOSI),
-            miso=Pin(config.CC1101_MISO),
+            sck=Pin(CC1101_SCK, Pin.OUT),
+            mosi=Pin(CC1101_MOSI, Pin.OUT),
+            miso=Pin(CC1101_MISO, Pin.IN),
         )
-        self.cs = Pin(config.CC1101_CS, Pin.OUT, value=1)
+        self.cs = Pin(CC1101_CS, Pin.OUT, value=1)
+        self.gdo0 = Pin(CC1101_GDO0, Pin.IN)
 
         self.reset()
-        self.configure_m20()
+        self._basic_init()
 
-    # --------------------------
-    # SPI helpers
-    # --------------------------
-    def _cs_low(self):
-        self.cs.value(0)
+    # -------- низкоуровневый SPI --------
+    def _xfer(self, b):
+        self.spi.write(bytearray([b]))
 
-    def _cs_high(self):
-        self.cs.value(1)
+    def _w_reg(self, addr, val):
+        self.cs.off()
+        self._xfer(addr & 0x3F)
+        self._xfer(val & 0xFF)
+        self.cs.on()
 
-    def write_reg(self, addr, value):
-        self._cs_low()
-        self.spi.write(bytearray([addr, value & 0xFF]))
-        self._cs_high()
+    def _r_reg(self, addr):
+        self.cs.off()
+        self._xfer((addr & 0x3F) | READ_SINGLE)
+        buf = bytearray(1)
+        self.spi.readinto(buf)
+        self.cs.on()
+        return buf[0]
 
-    def read_reg(self, addr):
-        self._cs_low()
-        self.spi.write(bytearray([addr | 0x80]))
-        v = self.spi.read(1)[0]
-        self._cs_high()
-        return v
+    def _strobe(self, cmd):
+        self.cs.off()
+        self._xfer(cmd)
+        self.cs.on()
 
-    def strobe(self, cmd):
-        self._cs_low()
-        self.spi.write(bytearray([cmd]))
-        self._cs_high()
-
-    # --------------------------
-    # RESET
-    # --------------------------
+    # --------- базовая инициализация ---------
     def reset(self):
-        # Жёсткая последовательность из даташита
-        self._cs_high()
-        time.sleep_us(30)
-        self._cs_low()
-        time.sleep_us(30)
-        self._cs_high()
-        time.sleep_us(45)
-
-        self.strobe(CMD_SRES)
+        self.cs.on()
+        time.sleep_ms(1)
+        self.cs.off()
+        time.sleep_ms(1)
+        self.cs.on()
+        time.sleep_ms(1)
+        self._strobe(SRES)
         time.sleep_ms(1)
 
-    # --------------------------
-    # Настройка под M20
-    # --------------------------
+    def _basic_init(self):
+        # Flush FIFO
+        self._strobe(SIDLE)
+        self._strobe(SFRX)
+        self._strobe(SFTX)
+
+        # GDO0 = асинхронные серийные данные (RAW data)
+        self._w_reg(IOCFG0, 0x0D)   # GDO0_CFG=0x0D: async serial data out
+        self._w_reg(IOCFG1, 0x2E)
+        self._w_reg(IOCFG2, 0x2E)
+
+        # Пакетный движок: асинхронный serial, CRC/addr off
+        self._w_reg(PKTCTRL1, 0x00)
+        # PKT_FORMAT=3 (async serial), LENGTH_CONFIG=2 (infinite), CRC off
+        # 0b0011_0010 = 0x32
+        self._w_reg(PKTCTRL0, 0x32)
+        self._w_reg(FIFOTHR,  0x47)
+
+        # 2-FSK, SYNC_MODE=000 (off), Manchester off
+        self._w_reg(MDMCFG2, 0x00)
+
+        # AGC / bit sync / FOC — типовые, как в многих примерах TI
+        self._w_reg(FOCCFG,   0x16)
+        self._w_reg(BSCFG,    0x6C)
+        self._w_reg(AGCCTRL2, 0x43)
+        self._w_reg(AGCCTRL1, 0x40)
+        self._w_reg(AGCCTRL0, 0x91)
+
+        # MCSM: после RX остаёмся в RX, автокалибровка
+        self._w_reg(MCSM0, 0x18)
+        self._w_reg(MCSM1, 0x0C)
+        self._w_reg(MCSM2, 0x07)
+
+        # Калибровка, тестовые регистры — типовые значения TI
+        self._w_reg(FREND1, 0x56)
+        self._w_reg(FREND0, 0x10)
+        self._w_reg(FSCAL3, 0xE9)
+        self._w_reg(FSCAL2, 0x2A)
+        self._w_reg(FSCAL1, 0x00)
+        self._w_reg(FSCAL0, 0x1F)
+        self._w_reg(TEST2,  0x81)
+        self._w_reg(TEST1,  0x35)
+        self._w_reg(TEST0,  0x09)
+
+    # ---------- расчёт частоты / скорости / девиации ----------
+    def _calc_freq_regs(self, freq_hz):
+        # Freq = F_XOSC * FREQ / 2^16
+        f = int(freq_hz * (1 << 16) / F_XOSC)
+        return (f >> 16) & 0xFF, (f >> 8) & 0xFF, f & 0xFF
+
+    def _calc_drate_regs(self, bitrate_hz):
+        best_err = 1e9
+        best_e = 0
+        best_m = 0
+        for e in range(16):
+            m = int(bitrate_hz * (2**28) / (F_XOSC * (2**e)) - 256)
+            if m < 0 or m > 255:
+                continue
+            drate = (256 + m) * (2**e) * F_XOSC / (2**28)
+            err = abs(drate - bitrate_hz)
+            if err < best_err:
+                best_err = err
+                best_e = e
+                best_m = m
+        return best_e, best_m
+
+    def _calc_rx_bw_regs(self, bw_hz):
+        # BW = Fxosc / (8 * (4 + M) * 2^E)
+        fx = F_XOSC
+        best_err = 1e9
+        best_e = 0
+        best_m = 0
+        for e in range(4):
+            for m in range(4):
+                bw = fx / (8.0 * (4 + m) * (2**e))
+                err = abs(bw - bw_hz)
+                if err < best_err:
+                    best_err = err
+                    best_e = e
+                    best_m = m
+        return best_e, best_m
+
+    def _calc_deviation_regs(self, dev_hz):
+        fx = F_XOSC
+        best_err = 1e9
+        best_e = 0
+        best_m = 0
+        for e in range(8):
+            for m in range(8):
+                dev = (8 + m) * (2**e) * fx / (2**17)
+                err = abs(dev - dev_hz)
+                if err < best_err:
+                    best_err = err
+                    best_e = e
+                    best_m = m
+        return best_e, best_m
+
+    # ------------------- публичные методы -------------------
     def configure_m20(self):
-        """
-        Настройка CC1101 под приём M20:
-        - dev ≈ 6 kHz (разнос ≈ 12 kHz)
-        - BW ≈ 100 kHz
-        - 2-FSK, SYNC off, RAW async на GDO0
-        """
+        # Скорость
+        e, m = self._calc_drate_regs(M20_BITRATE)
+        # Полоса
+        bw_e, bw_m = self._calc_rx_bw_regs(M20_BW_KHZ * 1000)
+        # Девиация
+        dev_e, dev_m = self._calc_deviation_regs(M20_DEVIATION_KHZ * 1000)
 
-        # В IDLE и чистим FIFO
-        self.strobe(CMD_SIDLE)
-        time.sleep_ms(1)
-        self.strobe(CMD_SFRX)
-        self.strobe(CMD_SFTX)
+        mdmcfg4 = ((bw_e & 0x3) << 6) | ((bw_m & 0x3) << 4) | (e & 0x0F)
+        self._w_reg(MDMCFG4, mdmcfg4)
+        self._w_reg(MDMCFG3, m & 0xFF)
+        self._w_reg(DEVIATN, ((dev_e & 0x7) << 4) | (dev_m & 0x7))
 
-        # Девиация ≈ 6 kHz (DEVIATION_E=1, M=7 → ~5.9 kHz)
-        self.write_reg(REG_DEVIATN, 0x17)
-
-        # MDMCFG4: CHANBW_E=3, CHANBW_M=0 → BW ≈ 100 kHz
-        #          DRATE_E=8  (с MDMCFG3=0x83 ≈ 9.6 ksym/s)
-        self.write_reg(REG_MDMCFG4, 0xC8)
-        self.write_reg(REG_MDMCFG3, 0x83)
-
-        # 2-FSK, SYNC_MODE=0 (без sync), манчестер выкл, whitening выкл
-        self.write_reg(REG_MDMCFG2, 0x13)
-        self.write_reg(REG_MDMCFG1, 0x22)
-        self.write_reg(REG_MDMCFG0, 0xF8)
-
-        # RAW async mode: GDO0 = serial data, без CRC и whitening
-        self.write_reg(REG_PKTCTRL0, 0x12)
-        self.write_reg(REG_PKTCTRL1, 0x00)
-
-        # GDO0 → serial data output
-        self.write_reg(REG_IOCFG0, 0x0D)
-
-        # AGC по-консервативнее
-        self.write_reg(REG_AGCCTRL2, 0x07)
-        self.write_reg(REG_AGCCTRL1, 0x00)
-        self.write_reg(REG_AGCCTRL0, 0x90)
-
-        # Frequency offset / bit sync
-        self.write_reg(REG_FOCCTRL, 0x1D)
-        self.write_reg(REG_BSCFG, 0x00)
-
-        # В RX
-        self.strobe(CMD_SRX)
-        time.sleep_ms(2)
-
-        print("CC1101 configured for M20 mode.")
-
-    # --------------------------
-    # Частота и RSSI
-    # --------------------------
     def set_frequency(self, freq_hz):
-        """
-        Устанавливает частоту (Гц), например 405400000.
-        Формула: FREQ = f_carrier * 2^16 / f_xosc, f_xosc = 26 МГц.
-        """
-        f_xosc = 26_000_000
-        freq_word = int(freq_hz * (2**16) / f_xosc) & 0xFFFFFF
-
-        f2 = (freq_word >> 16) & 0xFF
-        f1 = (freq_word >> 8) & 0xFF
-        f0 = freq_word & 0xFF
-
-        self.write_reg(REG_FREQ2, f2)
-        self.write_reg(REG_FREQ1, f1)
-        self.write_reg(REG_FREQ0, f0)
-
-        # Калибруем синтезатор
-        self.strobe(CMD_SCAL)
+        f2, f1, f0 = self._calc_freq_regs(freq_hz)
+        self._w_reg(FREQ2, f2)
+        self._w_reg(FREQ1, f1)
+        self._w_reg(FREQ0, f0)
+        # пересинтез
+        self._strobe(SCAL)
         time.sleep_ms(1)
 
-    def read_rssi(self):
-        """
-        Читает RSSI и переводит в dBm.
-        Стандартная формула TI:
-        RSSI_dec = регистр 0x34 (signed)
-        RSSI_dBm ≈ RSSI_dec/2 - 74 (для 26 МГц).
-        """
-        raw = self.read_reg(REG_RSSI)
+    def enter_rx(self):
+        self._strobe(SRX)
+
+    def read_rssi_dbm(self):
+        raw = self._r_reg(RSSI)
         if raw >= 128:
-            raw -= 256  # sign extend
+            raw -= 256
+        # RSSI_dBm ~= (RSSI_REG/2) - 74
         return raw / 2.0 - 74.0
+
+    def read_freqest(self):
+        """Считать FREQEST (signed int8)."""
+        fe = self._r_reg(FREQEST)
+        if fe >= 128:
+            fe -= 256
+        return fe

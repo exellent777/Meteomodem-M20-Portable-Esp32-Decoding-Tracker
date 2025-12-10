@@ -1,66 +1,112 @@
-# afc.py — мягкое автоподстройка частоты (AFC) для M20 Tracker
-# Работает вместе с main.py и cc1101.py
-# Не ломает RAW-поток, корректно действует только когда есть устойчивый сигнал.
+# afc.py — AFC с дополнительной статистикой для Web UI
 
 import time
 
-# Ограничение максимального отклонения за раз (Гц)
-MAX_STEP_HZ = 1500          # мягкая подстройка
-GOOD_RSSI_THRESHOLD = -102  # если RSSI лучше — можно смещать частоту
-
-# Исторический фильтр drift
-DRIFT_ALPHA = 0.3
-
-
 class AFC:
-    def __init__(self):
-        self.last_drift = 0.0
+    def __init__(self, radio, track, step_hz=400, min_streak=3,
+                 loss_timeout=6.0, use_freqest=True, debug=False):
+        self.radio = radio
+        self.track = track
 
-    def _smooth(self, drift):
-        """Экспоненциальное сглаживание смещения."""
-        self.last_drift = DRIFT_ALPHA * drift + (1 - DRIFT_ALPHA) * self.last_drift
-        return self.last_drift
+        self.step = step_hz
+        self.min_streak = min_streak
+        self.loss_timeout = loss_timeout
+        self.use_freqest = use_freqest
+        self.debug = debug
 
-    def correct_frequency(self, radio, freq_hz, rssi_dbm, frame_ok=False):
-        """
-        Корректирует частоту:
-          - Если сильный сигнал → используем RSSI-подстройку.
-          - Если есть валидный кадр → добавляем небольшое усиление коррекции.
-          - Если слабый сигнал → АФК не применяется.
-        """
+        self.streak = 0
+        self.last_ok = 0
+        self.confirmed_freq = None
 
-        if rssi_dbm is None:
-            return freq_hz
+        # новые поля для UI
+        self.last_freqest = 0   # последнее значение FREQEST (signed)
+        self.last_df = 0        # последний шаг Δf по FREQEST
 
-        # Если сигнал слабый — не корректируем
-        if rssi_dbm < GOOD_RSSI_THRESHOLD:
-            return freq_hz
+    def on_valid_frame(self, frame):
+        self.streak += 1
+        self.last_ok = time.ticks_ms()
 
-        # Предполагаем, что оптимальная частота — там, где RSSI максимален
-        # Фиктивная оценка: чем ближе к центру демодуляции, тем выше RSSI.
-        drift = (rssi_dbm + 100) * 20   # 20 Гц изменения на 1 dB
+        if self.debug:
+            print("[AFC] valid frame, streak", self.streak)
 
-        if frame_ok:
-            drift *= 1.4  # сильнее тянем к центру, если кадр валиден
+        if self.streak == self.min_streak:
+            self.confirmed_freq = self.track.freq
+            if self.debug:
+                print("[AFC] freq confirmed", self.confirmed_freq)
+            self._refine_frequency()
 
-        drift = self._smooth(drift)
+        if self.use_freqest and self.confirmed_freq is not None:
+            self._apply_freqest()
 
-        # Ограничиваем максимальный шаг
-        if drift > MAX_STEP_HZ:
-            drift = MAX_STEP_HZ
-        elif drift < -MAX_STEP_HZ:
-            drift = -MAX_STEP_HZ
+    def check_loss(self):
+        if self.last_ok == 0:
+            return False
+        dt = time.ticks_diff(time.ticks_ms(), self.last_ok) / 1000.0
+        if dt > self.loss_timeout:
+            if self.debug:
+                print("[AFC] loss, reset")
+            self.reset()
+            return True
+        return False
 
-        new_freq = int(freq_hz + drift)
+    def reset(self):
+        self.streak = 0
+        self.confirmed_freq = None
+        self.last_ok = 0
+        self.last_freqest = 0
+        self.last_df = 0
 
-        # Применяем
+    def _refine_frequency(self):
+        base = self.confirmed_freq
+        if base is None:
+            return
+
+        candidates = [base, base - self.step, base + self.step]
+        best_freq = base
+        best_score = -1e9
+
+        if self.debug:
+            print("[AFC] refine…")
+
+        for f in candidates:
+            self.radio.set_frequency(f)
+            time.sleep_ms(150)
+            score = (self.track.signal * 10.0) + self.track.snr
+            if self.debug:
+                print("  f=", f, "score=", score)
+            if score > best_score:
+                best_score = score
+                best_freq = f
+
+        if self.debug:
+            print("[AFC] best", best_freq)
+
+        self.radio.set_frequency(best_freq)
+        self.track.freq = best_freq
+        self.confirmed_freq = best_freq
+
+    def _apply_freqest(self):
         try:
-            radio.set_frequency(new_freq)
+            fe = self.radio.read_freqest()
         except Exception:
-            return freq_hz
+            return
 
-        return new_freq
+        if fe > 127:
+            fe -= 256
 
+        self.last_freqest = fe
 
-# Экземпляр
-afc = AFC()
+        if abs(fe) < 2:
+            self.last_df = 0
+            return
+
+        df = fe * 400
+        new_f = int(self.track.freq + df)
+        self.last_df = df
+
+        if self.debug:
+            print("[AFC] FREQEST", fe, "df", df, "new", new_f)
+
+        self.radio.set_frequency(new_f)
+        self.track.freq = new_f
+        self.confirmed_freq = new_f
